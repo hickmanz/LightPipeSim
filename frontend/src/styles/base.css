@@ -1,0 +1,125 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--neutral-1);
+}
+
+#app {
+  min-height: 100vh;
+  user-select: none;
+}
+
+/* Body-level pointer-event overrides for overlay modes */
+body.line-markup-active .floating-actions {
+  pointer-events: none !important;
+  z-index: 1001 !important;
+}
+
+body.line-markup-active .action-bar {
+  pointer-events: auto !important;
+  z-index: 1001 !important;
+  position: relative;
+}
+
+body.line-markup-active .action-btn,
+body.line-markup-active .draw-dropdown,
+body.line-markup-active .explode-dropdown {
+  pointer-events: auto !important;
+  position: relative;
+  z-index: 1001 !important;
+}
+
+body.line-markup-active .draw-menu,
+body.line-markup-active .explode-menu {
+  pointer-events: auto !important;
+  z-index: 1002 !important;
+}
+
+body.line-markup-active .viewer-right-panels {
+  pointer-events: none !important;
+  z-index: 1001 !important;
+}
+
+body.line-markup-active .viewer-right-panels .section-panel,
+body.line-markup-active .viewer-right-panels .measure-panel {
+  pointer-events: auto !important;
+}
+
+body.line-markup-active .top-tool-island,
+body.feedback-dialog-open .top-tool-island {
+  z-index: 1001;
+}
+
+body.line-markup-active .top-tool-bar,
+body.feedback-dialog-open .top-tool-bar {
+  z-index: 1001;
+}
+
+body.line-markup-active .top-color-menu {
+  pointer-events: auto !important;
+  z-index: 1002 !important;
+}
+
+body.line-markup-active .top-thickness-menu {
+  pointer-events: auto !important;
+  z-index: 1002 !important;
+}
+
+/* Legacy slot selectors */
+[slot="toolbar-left"] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 6px;
+  border-right: 1px solid #ddd;
+  background: #f7f7f7;
+}
+
+#viewer {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+[slot="panel-right"] {
+  width: 300px;
+  border-left: 1px solid #ddd;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+}
+
+h3 {
+  margin-top: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--neutral-1);
+  color: var(--neutral-11);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+th,
+td {
+  padding: 10px var(--spacing-md);
+  border-bottom: 1px solid var(--neutral-3);
+}
+
+th {
+  text-align: left;
+  background: var(--neutral-2);
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+td.role {
+  font-weight: 600;
+  text-transform: capitalize;
+}

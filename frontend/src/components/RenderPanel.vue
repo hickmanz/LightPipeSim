@@ -1,0 +1,81 @@
+<template>
+  <section class="res-card">
+    <div class="hm-title"><span>Picture of the exit surface (Mitsuba 3)</span></div>
+    <p v-if="st && !st.available" class="muted small">{{ st.reason }}</p>
+    <template v-else>
+      <div class="render-form">
+        <label class="mini">
+          <span>Method</span>
+          <select v-model="form.mode">
+            <option value="map">From this simulation (fast, smooth)</option>
+            <option value="transport">Full light transport in Mitsuba (slow, noisy)</option>
+          </select>
+        </label>
+        <label class="mini narrow"><span>Width</span>
+          <select v-model.number="form.width"><option v-for="w in [320, 640, 960, 1280]" :key="w" :value="w">{{ w }} px</option></select>
+        </label>
+        <label class="mini narrow"><span>Samples</span>
+          <select v-model.number="form.spp"><option v-for="s in [8, 32, 128, 512, 2048]" :key="s" :value="s">{{ s }}</option></select>
+        </label>
+        <label class="mini narrow"><span>Turn {{ form.azimuth }}°</span><input v-model.number="form.azimuth" type="range" min="-70" max="70" step="5" /></label>
+        <label class="mini narrow"><span>Tilt {{ form.elevation }}°</span><input v-model.number="form.elevation" type="range" min="-70" max="70" step="5" /></label>
+        <label class="mini narrow"><span>Zoom {{ form.zoom.toFixed(1) }}×</span><input v-model.number="form.zoom" type="range" min="0.5" max="4" step="0.1" /></label>
+        <label class="mini narrow"><span>Exposure {{ form.exposure }} EV</span><input v-model.number="form.exposure" type="range" min="-4" max="4" step="0.5" /></label>
+        <label v-if="form.mode === 'map'" class="mini narrow" title="Light on the housing, so its colour shows next to the glowing exit surface"><span>Room light {{ Math.round(form.ambient * 100) }}%</span><input v-model.number="form.ambient" type="range" min="0" max="0.3" step="0.01" /></label>
+        <label class="check small"><input v-model="form.white_balance" type="checkbox" /> neutral white balance</label>
+        <button v-if="!busy" class="btn primary small" @click="start"><Camera :size="14" /> Render picture</button>
+        <button v-else class="btn small" @click="cancel"><X :size="14" /> Cancel</button>
+      </div>
+      <div v-if="busy" class="progress thin"><div class="progress-bar" :style="{ width: Math.round((st?.render?.progress.fraction ?? 0) * 100) + '%' }" /></div>
+      <p v-if="busy" class="muted small">{{ st?.render?.progress.phase || "Queued" }}</p>
+      <p v-if="error || st?.render?.status === 'failed'" class="error small">{{ error || st?.render?.error }}</p>
+      <img v-if="st?.render?.hasImage && !busy" :src="api.renderUrl(runId, st.render.finished ?? 0)" class="render-img" alt="Rendered picture of the exit surface" />
+      <div v-for="w in st?.render?.info?.warnings ?? []" :key="w" class="notice info"><Info :size="15" /><span>{{ w }}</span></div>
+      <p class="muted small">
+        The picture shows how the exit surface looks to a camera in a dark room, for the state chosen at the top. The numbers on this page always come from the simulation.
+        {{ form.mode === "transport" ? "Full transport finds the small LEDs only by chance through the glass, so it needs thousands of samples to look clean." : "" }}
+      </p>
+    </template>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { Camera, Info, X } from "lucide-vue-next";
+import { api, type RenderState } from "../api";
+
+const props = defineProps<{ runId: string; state?: string }>();
+const st = ref<RenderState | null>(null);
+const error = ref("");
+const form = reactive({ mode: "map" as "map" | "transport", width: 640, spp: 32, azimuth: 0, elevation: 0, zoom: 1, exposure: 0, ambient: 0.04, white_balance: true });
+let timer: number | undefined;
+
+const busy = computed(() => st.value?.render?.status === "queued" || st.value?.render?.status === "running");
+
+async function refresh() {
+  try {
+    st.value = await api.getRender(props.runId);
+    error.value = "";
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+  window.clearTimeout(timer);
+  if (busy.value) timer = window.setTimeout(refresh, 800);
+}
+async function start() {
+  error.value = "";
+  try {
+    st.value = await api.createRender(props.runId, { ...form, state: props.state });
+    window.clearTimeout(timer);
+    timer = window.setTimeout(refresh, 600);
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+async function cancel() {
+  await api.cancelRender(props.runId);
+  await refresh();
+}
+watch(() => props.runId, refresh, { immediate: true });
+onBeforeUnmount(() => window.clearTimeout(timer));
+</script>

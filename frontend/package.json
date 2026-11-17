@@ -1,0 +1,28 @@
+{
+  "name": "lightsim-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:fast": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@radix-ui/colors": "^3.0.0",
+    "lucide-vue-next": "^0.563.0",
+    "meshoptimizer": "^1.0.1",
+    "three": "^0.182.0",
+    "three-mesh-bvh": "^0.9.1",
+    "vue": "^3.5.27",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/three": "^0.182.0",
+    "@vitejs/plugin-vue": "^6.0.3",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vue-tsc": "^3.0.0"
+  }
+}

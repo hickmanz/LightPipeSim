@@ -1,0 +1,287 @@
+// Everything the revision page shares between its panels: the revision, its parts, the project setup (auto-saved),
+// the library, the server's validation of the setup and the simulation runs.
+import { computed, inject, onBeforeUnmount, provide, ref, shallowRef, watch, type InjectionKey, type Ref } from "vue";
+import { api, type CheckResult, type Library, type PartDoc, type PartsDoc, type Project, type RevisionMeta, type RunMeta, type Setup } from "../api";
+import { emptySetup } from "../utils/setup";
+import type { FaceHighlight } from "./useSetupScene";
+
+export type PickMode =
+  | { kind: "led"; ledId: string }
+  | { kind: "detector"; detectorId: string }
+  | { kind: "override"; instanceId: string; finish: string }
+  | { kind: "part" }
+  | { kind: "group"; groupId: string }
+  | null;
+
+/** Colour of an analysis group (#rrggbb) as a three.js number. */
+export const hexToNumber = (hex: string | undefined, fallback = 0x8b5cf6) => {
+  const m = /^#?([0-9a-f]{6})$/i.exec((hex ?? "").trim());
+  return m ? parseInt(m[1], 16) : fallback;
+};
+
+export function createWorkspace(rid: Ref<string>) {
+  const meta = ref<RevisionMeta | null>(null);
+  const project = ref<Project | null>(null);
+  const loadError = ref<string | null>(null);
+  const partsDoc = shallowRef<PartsDoc | null>(null);
+  const library = ref<Library | null>(null);
+  const setup = ref<Setup | null>(null);
+  const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
+  const saveError = ref("");
+  const check = ref<CheckResult | null>(null);
+  const checkError = ref("");
+  const checking = ref(false);
+  const runs = ref<RunMeta[]>([]);
+  const pick = ref<PickMode>(null);
+  const selectedPart = ref<string | null>(null);
+  const suggestNotes = ref<string[]>([]);
+  const newLedModel = ref("white_generic"); // library model used when LEDs are added by picking faces
+  const overrideFinish = ref("mirror"); // finish applied to faces picked as overrides
+  const showGroups = ref(false); // paint the analysis groups on the model (set while the Groups tab is open)
+  const focusGroup = ref<string | null>(null); // the group highlighted more strongly
+  const runOrientationStale = ref(false); // the opened run's exit map is flipped compared with the current setup (set by the page)
+
+  const parts = computed<PartDoc[]>(() => partsDoc.value?.instances ?? []);
+  const isActive = computed(() => meta.value?.status === "queued" || meta.value?.status === "running");
+  const ready = computed(() => meta.value?.status === "ready");
+  /** The variant (design alternative) of this revision; its setup is the one edited here. */
+  const variantId = computed(() => meta.value?.variantId ?? project.value?.variants?.[0]?.id);
+  const variant = computed(() => project.value?.variants?.find((v) => v.id === variantId.value) ?? null);
+  const fetchSetup = () => (variantId.value ? api.getVariantSetup(meta.value!.projectId, variantId.value) : api.getSetup(meta.value!.projectId));
+  const storeSetup = (s: Setup) => (variantId.value ? api.putVariantSetup(meta.value!.projectId, variantId.value, s) : api.putSetup(meta.value!.projectId, s));
+
+  // ── polling the import job ─────────────────────────────────────────────────
+  let pollTimer: number | undefined;
+  async function refreshMeta() {
+    try {
+      meta.value = await api.getRevision(rid.value);
+      loadError.value = null;
+      if (meta.value.projectId && (!project.value || project.value.id !== meta.value.projectId)) loadProject();
+    } catch (e) {
+      loadError.value = (e as Error).message;
+    }
+  }
+  async function loadProject() {
+    if (!meta.value) return;
+    try {
+      project.value = await api.getProject(meta.value.projectId);
+    } catch {
+      project.value = null;
+    }
+  }
+  function schedulePoll() {
+    window.clearTimeout(pollTimer);
+    pollTimer = window.setTimeout(async () => {
+      await refreshMeta();
+      if (isActive.value) schedulePoll();
+    }, 700);
+  }
+
+  // ── setup (auto-saved) ─────────────────────────────────────────────────────
+  let saveTimer: number | undefined;
+  let checkTimer: number | undefined;
+  let loadingSetup = false;
+  async function loadSetup() {
+    if (!meta.value) return;
+    loadingSetup = true;
+    try {
+      const s = await fetchSetup();
+      setup.value = { ...emptySetup(), ...s, parts: s.parts?.length ? s.parts : emptySetup().parts };
+    } finally {
+      // the watcher fires after this tick; ignore that change
+      window.setTimeout(() => (loadingSetup = false), 0);
+    }
+    scheduleCheck(0);
+  }
+
+  async function saveNow() {
+    if (!setup.value || !meta.value) return;
+    saveState.value = "saving";
+    try {
+      await storeSetup(setup.value);
+      saveState.value = "saved";
+      saveError.value = "";
+    } catch (e) {
+      saveState.value = "error";
+      saveError.value = (e as Error).message;
+    }
+  }
+  watch(
+    setup,
+    () => {
+      if (loadingSetup || !setup.value) return;
+      window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(saveNow, 500);
+      scheduleCheck(900);
+    },
+    { deep: true },
+  );
+
+  function scheduleCheck(delay: number) {
+    window.clearTimeout(checkTimer);
+    checkTimer = window.setTimeout(runCheck, delay);
+  }
+  async function runCheck() {
+    if (!setup.value || !ready.value) return;
+    checking.value = true;
+    try {
+      check.value = await api.check(rid.value, setup.value);
+      checkError.value = "";
+    } catch (e) {
+      check.value = null;
+      checkError.value = (e as Error).message;
+    } finally {
+      checking.value = false;
+    }
+  }
+
+  /** Apply an edit to the setup (the auto-save and re-validation follow). */
+  function mutate(fn: (s: Setup) => void) {
+    if (!setup.value) return;
+    fn(setup.value);
+  }
+
+  async function suggest(): Promise<void> {
+    const s = await api.suggestSetup(rid.value);
+    suggestNotes.value = s.notes;
+    setup.value = { parts: s.parts, leds: s.leds, detectors: s.detectors, states: s.states };
+  }
+
+  /** Adapt the variant's setup to this revision's geometry (LEDs added or removed, "only" states regenerated). */
+  async function reconcile(): Promise<void> {
+    const r = await api.reconcileSetup(rid.value);
+    suggestNotes.value = r.warnings;
+    setup.value = { ...emptySetup(), ...r.setup };
+  }
+
+  /** Store the faces that were re-matched on this revision in the setup, so the "re-matched" notices go away. */
+  async function acceptFaceMatches(): Promise<string[]> {
+    if (!setup.value) return [];
+    const r = await api.acceptFaceMatches(rid.value, setup.value);
+    if (r.changes.length) setup.value = { ...emptySetup(), ...r.setup }; // the auto-save and re-check follow
+    return r.changes;
+  }
+
+  // ── library ───────────────────────────────────────────────────────────────
+  async function loadLibrary() {
+    library.value = await api.library();
+  }
+
+  // ── runs ─────────────────────────────────────────────────────────────────
+  let runTimer: number | undefined;
+  async function loadRuns() {
+    try {
+      runs.value = await api.listRuns(rid.value);
+    } catch {
+      /* not imported yet */
+    }
+    window.clearTimeout(runTimer);
+    if (runs.value.some((r) => r.status === "queued" || r.status === "running")) runTimer = window.setTimeout(loadRuns, 800);
+  }
+
+  // ── 3D highlights derived from the (server-resolved) setup ───────────────────────
+  const highlights = computed<FaceHighlight[]>(() => {
+    const out: FaceHighlight[] = [];
+    const s = setup.value;
+    if (!s) return out;
+    const res = check.value?.resolved;
+    for (const d of s.detectors) {
+      const list = res?.detectors?.[d.id];
+      if (list) list.forEach((f, i) => out.push({ key: `det:${d.id}:${i}`, instanceId: f.instance, face: f.face, color: 0x06b6d4, opacity: 0.75 }));
+    }
+    for (const led of s.leds) {
+      const f = res?.leds?.[led.id];
+      if (f) out.push({ key: `led:${led.id}`, instanceId: f.instance, face: f.face, color: 0xf97316, opacity: 0.85 });
+    }
+    if (showGroups.value) {
+      for (const g of check.value?.groups ?? []) {
+        if (g.index >= 62) continue; // "other tagged faces"
+        const color = hexToNumber(g.color);
+        const focus = focusGroup.value === g.id;
+        g.faces.forEach((f, i) => {
+          if (f.face === null || f.face === undefined) return;
+          out.push({ key: `grp:${g.id}:${i}`, instanceId: f.instance, face: f.face, color, opacity: focus ? 0.95 : focusGroup.value ? 0.3 : 0.65 });
+        });
+      }
+    }
+    return out;
+  });
+
+  function start() {
+    refreshMeta().then(() => {
+      if (isActive.value) schedulePoll();
+    });
+  }
+
+  watch(
+    () => meta.value?.status,
+    async (status) => {
+      if (status === "ready" && !partsDoc.value) {
+        partsDoc.value = await api.parts(rid.value);
+        await Promise.all([loadSetup(), loadLibrary(), loadRuns()]);
+      }
+    },
+    { immediate: true },
+  );
+
+  onBeforeUnmount(() => {
+    window.clearTimeout(pollTimer);
+    window.clearTimeout(saveTimer);
+    window.clearTimeout(checkTimer);
+    window.clearTimeout(runTimer);
+    // flush a pending save
+    if (saveTimer !== undefined && setup.value && meta.value) void storeSetup(setup.value);
+  });
+
+  return {
+    rid,
+    meta,
+    project,
+    loadError,
+    partsDoc,
+    parts,
+    library,
+    setup,
+    saveState,
+    saveError,
+    check,
+    checkError,
+    checking,
+    runs,
+    pick,
+    selectedPart,
+    showGroups,
+    focusGroup,
+    runOrientationStale,
+    suggestNotes,
+    newLedModel,
+    overrideFinish,
+    isActive,
+    ready,
+    variantId,
+    variant,
+    reconcile,
+    acceptFaceMatches,
+    highlights,
+    start,
+    schedulePoll,
+    refreshMeta,
+    loadProject,
+    loadLibrary,
+    loadRuns,
+    mutate,
+    suggest,
+    runCheck,
+    scheduleCheck,
+    saveNow,
+  };
+}
+
+export type Workspace = ReturnType<typeof createWorkspace>;
+const KEY: InjectionKey<Workspace> = Symbol("lightsim-workspace");
+export const provideWorkspace = (ws: Workspace) => provide(KEY, ws);
+export function useWorkspace(): Workspace {
+  const ws = inject(KEY);
+  if (!ws) throw new Error("workspace not provided");
+  return ws;
+}

@@ -1,0 +1,15 @@
+.venv/
+node_modules/
+frontend/dist/
+build/
+dist/
+dist-installer/
+.pytest_cache/
+__pycache__/
+*.pyc
+tmp_*
+*.log
+.DS_Store
+.devdata/
+.devserver.err
+scratch/
