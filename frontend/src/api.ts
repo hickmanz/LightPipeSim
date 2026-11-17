@@ -697,6 +697,44 @@ export interface AppConfig {
   version: string;
   mode: "window" | "browser" | "headless";
   copied?: number;
+  update: UpdateSettings;
+  /** True in the installed app: only there can an update be installed. */
+  canInstallUpdates: boolean;
+}
+
+export interface UpdateSettings {
+  source: "github" | "custom";
+  /** Custom source: a folder (also a network share) or a web address with the installer. */
+  location: string;
+  auto: boolean;
+  prerelease: boolean;
+}
+
+export interface UpdateOffer {
+  version: string;
+  file: string;
+  notes: string;
+  page: string | null;
+  size: number | null;
+  hasChecksum: boolean;
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest: string | null;
+  available: boolean;
+  offer: UpdateOffer | null;
+  source: string;
+  checkedAt: number;
+}
+
+export interface UpdateStatus {
+  state: "idle" | "downloading" | "ready" | "failed" | "launching";
+  done: number;
+  total: number;
+  message: string;
+  version: string | null;
+  canInstall: boolean;
 }
 
 /** A failed request. */
@@ -876,4 +914,9 @@ export const api = {
   setDataDir: (dataDir: string, copyExisting: boolean) => request<AppConfig>("/api/config", jsonInit("PUT", { dataDir, copyExisting })),
   pickFolder: (initial?: string) => post<{ path: string | null; error?: string }>(`/api/fs/pick-folder${query({ initial })}`),
   quit: () => post<{ ok: boolean }>("/api/app/quit"),
+  setUpdateSettings: (s: Partial<UpdateSettings>) => request<UpdateSettings>("/api/update/settings", jsonInit("PUT", s)),
+  checkUpdate: () => post<UpdateCheck>("/api/update/check"),
+  updateStatus: () => request<UpdateStatus>("/api/update/status"),
+  downloadUpdate: () => post<UpdateStatus>("/api/update/download"),
+  installUpdate: () => post<{ launched: boolean; message: string; path: string }>("/api/update/install"),
 };

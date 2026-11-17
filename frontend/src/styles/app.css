@@ -285,6 +285,23 @@ button.link {
   background: var(--radix-blue-2);
   color: var(--radix-blue-11);
 }
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  background: var(--radix-blue-2);
+  color: var(--radix-blue-9);
+  font-size: 0.85rem;
+}
+.dark .update-banner {
+  color: var(--radix-blue-11);
+}
+.update-banner a {
+  color: inherit;
+  text-decoration: underline;
+}
 .failure-list {
   margin: 6px 0 0;
   padding-left: 16px;

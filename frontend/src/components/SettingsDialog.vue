@@ -29,6 +29,73 @@
       <hr class="modal-sep" />
 
       <section class="settings-section">
+        <h4>Updates</h4>
+        <p class="muted small">LightSim {{ cfg?.version }}. Where the app looks for a newer installer:</p>
+        <label class="field">
+          <span>Update source</span>
+          <select v-model="upd.source" class="text-input" :disabled="updateInstalling" @change="saveUpdate">
+            <option value="github">GitHub releases (hickmanz/LightPipeSim)</option>
+            <option value="custom">A folder or web address of my own</option>
+          </select>
+        </label>
+        <template v-if="upd.source === 'custom'">
+          <div class="folder-row">
+            <input
+              v-model="upd.location"
+              type="text"
+              placeholder="D:\Releases  or  \\server\share\LightSim  or  https://example.com/lightsim"
+              :disabled="updateInstalling"
+              @change="saveUpdate"
+              @keydown.enter="saveUpdate"
+            />
+            <button class="btn" :disabled="updateInstalling" @click="browseUpdate"><FolderOpen :size="15" /> Browse…</button>
+          </div>
+          <p class="muted small">
+            It holds <code>LightSim-Setup-&lt;version&gt;.exe</code>; the highest version is offered. A <code>latest.json</code> next to it
+            (<code>{"version", "file", "sha256", "notes"}</code>, written by <code>packaging\build.ps1</code>) is used when present and is required for a web address.
+          </p>
+        </template>
+        <label v-else class="field row">
+          <input v-model="upd.prerelease" type="checkbox" :disabled="updateInstalling" @change="saveUpdate" />
+          <span>Include pre-releases (betas)</span>
+        </label>
+        <label class="field row">
+          <input v-model="upd.auto" type="checkbox" :disabled="updateInstalling" @change="saveUpdate" />
+          <span>Check for updates when the app starts</span>
+        </label>
+
+        <div class="modal-actions" style="justify-content: flex-start">
+          <button class="btn" :disabled="updateChecking || updateInstalling" @click="check">
+            <RefreshCw :size="15" /> {{ updateChecking ? "Checking…" : "Check now" }}
+          </button>
+          <button v-if="updateCheck?.available && cfg?.canInstallUpdates" class="btn primary" :disabled="updateInstalling" @click="installUpdate">
+            <Download :size="15" /> {{ updateInstalling ? "Updating…" : `Install ${updateCheck.latest}` }}
+          </button>
+        </div>
+        <div v-if="updateInstalling && updateProgress" class="progress thin" style="margin-top: 6px">
+          <div class="progress-bar" :style="{ width: updateProgress.total ? Math.round((updateProgress.done / updateProgress.total) * 100) + '%' : '30%' }" />
+        </div>
+        <p v-if="updateInstalling" class="muted small">
+          {{ updateProgress?.state === "launching" ? "Installing the update. LightSim restarts by itself." : `Downloading… ${updateProgress?.total ? fmtMB(updateProgress.done) + " of " + fmtMB(updateProgress.total) : ""}` }}
+        </p>
+        <p v-if="updateError" class="small error">{{ updateError }}</p>
+        <template v-else-if="updateCheck && !updateInstalling">
+          <p v-if="updateCheck.available" class="small ok-text">
+            Version {{ updateCheck.latest }} is available.
+            <a v-if="updateCheck.offer?.page" :href="updateCheck.offer.page" target="_blank" rel="noopener">Release notes</a>
+          </p>
+          <p v-else-if="updateCheck.latest" class="small ok-text">You have the newest version ({{ updateCheck.current }}).</p>
+          <p v-else class="muted small">No installer was found at this source.</p>
+          <p v-if="updateCheck.available && !cfg?.canInstallUpdates" class="muted small">
+            Updates install from the installed app only (this is a development copy).
+          </p>
+          <pre v-if="updateCheck.available && updateCheck.offer?.notes" class="update-notes">{{ updateCheck.offer.notes }}</pre>
+        </template>
+      </section>
+
+      <hr class="modal-sep" />
+
+      <section class="settings-section">
         <h4>This app</h4>
         <p class="muted small">LightSim version {{ cfg?.version }}.</p>
         <p v-if="cfg?.mode === 'window'" class="muted small">Close the window to quit the app.</p>
@@ -49,8 +116,18 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { AlertTriangle, FolderOpen, Power } from "lucide-vue-next";
-import { api, type AppConfig } from "../api";
+import { AlertTriangle, Download, FolderOpen, Power, RefreshCw } from "lucide-vue-next";
+import { api, type AppConfig, type UpdateSettings } from "../api";
+import {
+  checkForUpdate,
+  fmtMB,
+  installUpdate,
+  updateCheck,
+  updateChecking,
+  updateError,
+  updateInstalling,
+  updateProgress,
+} from "../composables/useUpdater";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -64,9 +141,40 @@ const quitMsg = ref("");
 
 const changed = computed(() => !!cfg.value && folder.value.trim() !== "" && folder.value.trim() !== cfg.value.dataDir);
 
+const upd = ref<UpdateSettings>({ source: "github", location: "", auto: true, prerelease: false });
+
 async function loadConfig() {
   cfg.value = await api.config();
   folder.value = cfg.value.dataDir;
+  upd.value = { ...cfg.value.update };
+}
+
+async function saveUpdate() {
+  updateError.value = "";
+  try {
+    upd.value = await api.setUpdateSettings({ ...upd.value, location: upd.value.location.trim() });
+    updateCheck.value = null; // the old answer belongs to the old source
+  } catch (e) {
+    updateError.value = (e as Error).message;
+  }
+}
+
+async function browseUpdate() {
+  try {
+    const res = await api.pickFolder(upd.value.location || undefined);
+    if (res.path) {
+      upd.value.location = res.path;
+      await saveUpdate();
+    } else if (res.error) updateError.value = `The folder dialog could not be opened (${res.error}). Type or paste the path instead.`;
+  } catch (e) {
+    updateError.value = (e as Error).message;
+  }
+}
+
+async function check() {
+  await saveUpdate(); // use what is typed, even if the field was not left yet
+  if (updateError.value) return;
+  await checkForUpdate();
 }
 
 async function browse() {
@@ -126,5 +234,15 @@ onMounted(loadConfig);
 code {
   font-size: 0.78rem;
   word-break: break-all;
+}
+.update-notes {
+  max-height: 140px;
+  overflow: auto;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  border: 1px solid var(--radix-gray-6, #ccc);
+  border-radius: 4px;
 }
 </style>

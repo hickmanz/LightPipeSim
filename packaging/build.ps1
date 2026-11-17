@@ -2,9 +2,10 @@
 #   -WithRender bundles Mitsuba 3 (several hundred MB) so that "Render picture" works in the installed app.
 #   1. stamps the version into server\lightsim\__version__.py when given
 #   2. builds the UI, 3. freezes the app with PyInstaller (dist\LightSim\)
-#   4. builds dist-installer\LightSim-Setup-<version>.exe with Inno Setup (+ .sha256)
+#   4. builds dist-installer\LightSim-Setup-<version>.exe with Inno Setup (+ .sha256 and latest.json for the in-app updater)
 param(
   [string]$Version = "",
+  [string]$Notes = "",
   [switch]$SkipInstaller,
   [switch]$WithRender
 )
@@ -60,4 +61,16 @@ if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 $setup = Join-Path $root "dist-installer\LightSim-Setup-$Version.exe"
 $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
 Set-Content -Path "$setup.sha256" -Value "$hash  $(Split-Path $setup -Leaf)" -Encoding ascii
+
+# latest.json: what the in-app updater reads when its update source is a folder or web address.
+# (GitHub releases need no manifest: the updater reads the release itself.)
+$manifest = [ordered]@{
+  version   = $Version
+  file      = (Split-Path $setup -Leaf)
+  sha256    = $hash
+  size      = (Get-Item $setup).Length
+  notes     = $Notes
+  published = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+$manifest | ConvertTo-Json | Set-Content -Path (Join-Path $root "dist-installer\latest.json") -Encoding utf8
 Write-Host "Done: $setup" -ForegroundColor Green

@@ -3,9 +3,28 @@
     <header class="home-head">
       <div class="brand"><Lightbulb :size="26" /> <span>LightSim</span></div>
       <div class="spacer" />
-      <button class="icon-btn" title="Settings: data folder" @click="settingsOpen = true"><Settings :size="18" /></button>
+      <button class="icon-btn" title="Settings: data folder, updates" @click="settingsOpen = true"><Settings :size="18" /></button>
       <button class="icon-btn" title="Toggle light/dark" @click="toggleTheme"><component :is="isDark ? Sun : Moon" :size="18" /></button>
     </header>
+
+    <div v-if="updateCheck?.available && !updateDismissed" class="update-banner">
+      <Download :size="16" />
+      <span>
+        LightSim <strong>{{ updateCheck.latest }}</strong> is available (you have {{ updateCheck.current }}).
+        <a v-if="updateCheck.offer?.page" :href="updateCheck.offer.page" target="_blank" rel="noopener">What's new</a>
+      </span>
+      <template v-if="updateInstalling">
+        <span class="muted small">
+          {{ updateProgress?.state === "launching" ? "Installing… LightSim restarts by itself." : `Downloading ${updateProgress?.total ? Math.round((updateProgress.done / updateProgress.total) * 100) + " %" : "…"}` }}
+        </span>
+      </template>
+      <template v-else>
+        <button v-if="canInstallUpdates" class="btn primary small" @click="installUpdate"><Download :size="14" /> Update now</button>
+        <button v-else class="btn small" @click="settingsOpen = true">Details</button>
+        <button class="icon-btn" title="Later" @click="updateDismissed = true"><X :size="15" /></button>
+      </template>
+      <span v-if="updateError" class="error small">{{ updateError }}</span>
+    </div>
 
     <main class="home-main">
       <section
@@ -103,10 +122,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { AlertTriangle, FileBox, Lightbulb, Moon, Pencil, Settings, Sun, Trash2, Upload, X } from "lucide-vue-next";
+import { AlertTriangle, Download, FileBox, Lightbulb, Moon, Pencil, Settings, Sun, Trash2, Upload, X } from "lucide-vue-next";
 import { api, type Project, type RevisionMeta } from "../api";
 import SettingsDialog from "../components/SettingsDialog.vue";
 import { isDark, toggleTheme } from "../composables/useTheme";
+import {
+  checkOnStartup,
+  installUpdate,
+  updateCheck,
+  updateDismissed,
+  updateError,
+  updateInstalling,
+  updateProgress,
+} from "../composables/useUpdater";
 import { fmtAgo } from "../utils/format";
 
 const router = useRouter();
@@ -224,6 +252,15 @@ async function remove(p: Project) {
   await attempt(() => api.deleteProject(p.id));
 }
 
-onMounted(refresh);
+const canInstallUpdates = ref(false);
+onMounted(async () => {
+  void refresh();
+  void checkOnStartup();
+  try {
+    canInstallUpdates.value = (await api.config()).canInstallUpdates;
+  } catch {
+    /* shown by refresh() */
+  }
+});
 onBeforeUnmount(() => window.clearTimeout(timer));
 </script>

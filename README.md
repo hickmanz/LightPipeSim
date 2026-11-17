@@ -16,6 +16,25 @@ Everything runs on your computer. Projects and results are stored in a data fold
 It was developed with Python 3.13 and a recent Node (the UI is built once with `npm run build`). The packaged installer is built with
 `.\packaging\build.ps1` (PyInstaller and Inno Setup).
 
+## Releasing and updating
+
+**Release:** push a tag (`git tag v0.2.0; git push origin v0.2.0`; a tag with a suffix such as `v0.3.0-beta.1` becomes a pre-release),
+or run *Actions > Release installer* by hand with a version. The workflow (`.github/workflows/release.yml`) builds
+`LightSim-Setup-<version>.exe` on a Windows runner and publishes it with its `.sha256` as a GitHub release. The version is
+stamped into the build from the tag; nothing needs to be committed first. The *Bundle Mitsuba 3* option of the manual run adds
+Render picture to the installer (several hundred MB).
+
+**Update:** the app checks for a newer installer when it starts (switch off in *Settings > Updates*) and offers *Update now*.
+The installer is downloaded, checked against its SHA-256 and run silently; the app restarts by itself. *Update source*
+in the same place chooses where it looks:
+
+- *GitHub releases* (default; the repository must be public), optionally including pre-releases.
+- *A folder or web address of my own*: a local folder, a network share (`\\server\share\LightSim`) or `https://…`. It holds
+  `LightSim-Setup-<version>.exe` (the highest version is offered, `.sha256` next to it is checked). `packaging\build.ps1` also
+  writes `latest.json` (`version`, `file`, `sha256`, `notes`) into `dist-installer\`; a web address needs that file.
+
+The installer is not code-signed, so Windows SmartScreen may warn when the installer is run by hand.
+
 ## Typical use
 
 1. Drop a STEP file on the start page. A new project is created; later drops can be added to it, either as a new revision of

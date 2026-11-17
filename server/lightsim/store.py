@@ -92,6 +92,17 @@ def set_data_dir(path: str | None) -> None:
     _configured_dir = path or None
 
 
+def get_setting(key: str, default: Any = None) -> Any:
+    """A per-machine app setting from config.json (next to the data-folder setting)."""
+    return _read_config().get(key, default)
+
+
+def set_setting(key: str, value: Any) -> None:
+    cfg = _read_config()
+    cfg[key] = value
+    _write_config(cfg)
+
+
 def validate_data_dir(path: str) -> Path:
     p = Path(path).expanduser()
     if not p.is_absolute():

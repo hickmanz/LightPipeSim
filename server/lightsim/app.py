@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import desktop, procutil, store
+from . import desktop, procutil, store, updater
 from .__version__ import __version__
 from .jobs import JobManager
 
@@ -1468,6 +1468,8 @@ def _config_payload() -> dict:
         "fromEnvironment": store.env_data_dir() is not None,
         "version": __version__,
         "mode": desktop.mode,
+        "update": updater.get_settings(),
+        "canInstallUpdates": updater.can_install(),
     }
 
 
@@ -1505,6 +1507,51 @@ def put_config(body: ConfigBody) -> dict:
         payload["copied"] = copied
         return payload
     return _config_payload()
+
+
+# -- updates -------------------------------------------------------------------------------
+class UpdateSettingsBody(BaseModel):
+    source: str | None = None
+    location: str | None = None
+    auto: bool | None = None
+    prerelease: bool | None = None
+
+
+def _update_call(fn, *args):
+    try:
+        return fn(*args)
+    except updater.UpdateError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.put("/api/update/settings")
+def put_update_settings(body: UpdateSettingsBody) -> dict:
+    return _update_call(updater.set_settings, body.model_dump(exclude_none=True))
+
+
+@app.post("/api/update/check")
+def check_update() -> dict:
+    return _update_call(updater.check)
+
+
+@app.get("/api/update/status")
+def update_status() -> dict:
+    return updater.status()
+
+
+@app.post("/api/update/download")
+def download_update() -> dict:
+    return _update_call(updater.start_download)
+
+
+@app.post("/api/update/install")
+def install_update() -> dict:
+    if jobs.any_active():
+        raise HTTPException(409, "A job is still running. Wait for it to finish (or cancel it) before updating.")
+    result = _update_call(updater.launch_installer)
+    if result["launched"]:
+        threading.Timer(1.0, _exit_now).start()  # the installer would end this process anyway; leave cleanly
+    return result
 
 
 @app.post("/api/fs/pick-folder")
