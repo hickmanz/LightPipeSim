@@ -53,6 +53,7 @@ class _Worker:
         self.scene = None
         self.t_scene = None  # the full light transport scene, built when asked for
         self.t_params = None
+        self.t_state: str | None = None  # the state the transport scene was built for
         self.t_ref = 1.0
         self.t_ref_key: tuple | None = None
         self.sdict: dict = {}
@@ -65,6 +66,12 @@ class _Worker:
         self.nspp = 0
         self.cam_key: tuple | None = None
         self.state_id: str | None = None
+        self.state_ids: list[str] = [st["id"] for st in mx.effective_states(self.setup)]
+
+    def _state(self, view: dict) -> str:
+        """The state to draw: the one asked for when the setup has it, else the first."""
+        want = view.get("state")
+        return want if want in self.state_ids else self.state_ids[0]
 
     # -- the scene follows the run's tallies ------------------------------------------------------------
     def _tallies_stamp(self) -> int:
@@ -78,13 +85,14 @@ class _Worker:
         stamp = self._tallies_stamp()
         if not stamp:
             return "The simulation has not saved any rays yet"
-        key = (stamp, view.get("state"), round(float(view.get("smooth", 1.0)), 2))
+        state = self._state(view)
+        key = (stamp, state, round(float(view.get("smooth", 1.0)), 2))
         if self.scene is not None and key == self.map_key:
             return None
         try:
             if self.scene is None:
                 d, info = mx.build_mitsuba_scene(
-                    self.rid, self.setup, self.library, view.get("state"),
+                    self.rid, self.setup, self.library, state,
                     {"mode": "map", "width": 640, "ambient": BASE_AMBIENT, "smooth": float(view.get("smooth", 1.0))},
                     self.rdir / "live_meshes", self.runid,
                 )
@@ -96,7 +104,7 @@ class _Worker:
                 self.n_exit = sum(1 for k in d if k.startswith("exit_"))
                 self.state_id = info.get("state")
             else:
-                maps, peak = mx.exit_maps(self.rid, self.runid, view.get("state") or self.state_id, float(view.get("smooth", 1.0)))
+                maps, peak = mx.exit_maps(self.rid, self.runid, state, float(view.get("smooth", 1.0)))
                 # The texture of a spectral emitter holds spectral-upsampling coefficients, not RGB, so writing the new
                 # map into the parameters would draw garbage: the scene is loaded again with the new bitmaps instead.
                 for k, rgb in enumerate(maps):
@@ -104,6 +112,7 @@ class _Worker:
                 self.scene = mi.load_dict(self.sdict)
                 self.params = mi.traverse(self.scene)
                 self.scale = float(peak)
+                self.state_id = state
         except ValueError as exc:  # e.g. no light has reached the exit surface yet
             return str(exc)
         self.map_key = key
@@ -112,12 +121,13 @@ class _Worker:
 
     def _ensure_transport(self, view: dict) -> str | None:
         """The full light transport scene: the LEDs themselves are the emitters, so it does not depend on the tallies."""
-        if self.t_scene is not None:
+        state = self._state(view)
+        if self.t_scene is not None and self.t_state == state:
             return None
         mi, mx = self.mi, self.mx
         try:
             d, info = mx.build_mitsuba_scene(
-                self.rid, self.setup, self.library, view.get("state"),
+                self.rid, self.setup, self.library, state,
                 {"mode": "transport", "width": 640, "max_depth": TRANSPORT_DEPTH, "ambient": BASE_AMBIENT},
                 self.rdir / "live_meshes_t", self.runid,
             )
@@ -126,6 +136,8 @@ class _Worker:
         d.pop("sensor", None)
         self.t_scene = mi.load_dict(d)
         self.t_params = mi.traverse(self.t_scene)
+        self.t_state = state
+        self.acc, self.nspp = None, 0  # another light: the picture starts over
         return None
 
     def _transport_reference(self, view: dict) -> str | None:
@@ -134,10 +146,11 @@ class _Worker:
         stamp = self._tallies_stamp()
         if not stamp:
             return "The simulation has not saved any rays yet"
-        key = (stamp, view.get("state"), round(float(view.get("smooth", 1.0)), 2))
+        state = self._state(view)
+        key = (stamp, state, round(float(view.get("smooth", 1.0)), 2))
         if key != self.t_ref_key:
             try:
-                _, peak = self.mx.exit_maps(self.rid, self.runid, view.get("state") or self.state_id, float(view.get("smooth", 1.0)))
+                _, peak = self.mx.exit_maps(self.rid, self.runid, state, float(view.get("smooth", 1.0)))
             except ValueError as exc:
                 return str(exc)
             self.t_ref, self.t_ref_key = peak * 0.9 / TRANSPORT_UNITS, key

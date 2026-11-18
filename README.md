@@ -16,6 +16,8 @@ Everything runs on your computer. Projects and results are stored in a data fold
 It was developed with Python 3.13 and a recent Node (the UI is built once with `npm run build`). The packaged installer is built with
 `.\packaging\build.ps1` (PyInstaller and Inno Setup).
 
+**GPU solver (optional).** With an NVIDIA GPU, `.venv\Scripts\python.exe -m pip install -r server\requirements-gpu.txt` adds a second solver (NVIDIA Warp on CUDA). It traces the same physics about 20 times faster than the CPU solver (about 3 million rays per second against 160,000 on a Ryzen 7 7800X3D with an RTX 5080, measured on a 330,000 triangle light pipe) and agrees with it within the noise of the maps. Choose it in the *Solver* select of the Run tab or the live preview; the CPU solver stays the default. Ray state and optics are float32 on the GPU (tallies are summed in float64), so results match the CPU solver statistically, not digit for digit. The light path analysis runs on the GPU too (about 1.6 million rays per second with it on): the face tables and group maps take every ray of every pass, also when a run stops early at a noise target, so no separate final pass is needed; the ray logs behind the analysis views still cover the first 2 million rays of a channel. A run's rays can only be replayed by the solver that traced them, so an analysis remembers its solver. `python server\scripts\gpu_bench.py <project> <revision> <setup>` compares and times both solvers on a stored project. The packaged installer does not include Warp.
+
 ## Releasing and updating
 
 **Release:** push a tag (`git tag v0.2.0; git push origin v0.2.0`; a tag with a suffix such as `v0.3.0-beta.1` becomes a pre-release),
@@ -45,7 +47,7 @@ The installer is not code-signed, so Windows SmartScreen may warn when the insta
 2. **Auto-setup** suggests materials, the LED positions and the exit surface from the CAD. Check them and change what is wrong:
    parts get a material (for example *PC + 0.03 wt % TiO2*) and a finish, LEDs are placed by clicking the emitting face, the
    exit surface is picked by clicking faces, and *States* define which LEDs (or colour channels) are on.
-3. **Run** a simulation. Quick looks use 200,000 rays per LED channel; use more for smooth colour maps.
+3. **Run** a simulation. Quick looks use 200,000 rays per LED channel; use more for smooth colour maps (the run settings go up to 50 million). The result shows *Map noise*: the relative standard error of a map pixel, with the number of rays or the map resolution that would bring it to 5 %. A map is judged converged at 5 % or less; before that, speckle on the map is noise, not light. *Stop early when map noise is below* traces in growing passes and stops as soon as the target is reached (the ray count is then the maximum; tick *Keep light path analysis* to add one final pass of about 2 million rays per channel that provides the analysis views; without it such a run has no analysis). *Quick look: one channel per LED* traces only the brightest driven channel of each LED (about 3 times faster for RGB LEDs), which is enough to judge how the light is spread but not its colour or absolute brightness.
 4. Open a run to see efficiency, luminance map, uniformity, hotspots, colour, per-LED contributions and where the light went.
    *Map on model* drapes the map on the CAD, *Rays* shows recorded ray paths, *Compare* sets two runs side by side (maps), or lists any number of runs of the project, across variants, in one table with
    changes against a baseline run and overlaid profiles. A state that a variant does not have falls back to "All LEDs on".
@@ -60,8 +62,20 @@ The installer is not code-signed, so Windows SmartScreen may warn when the insta
   Beer-Lambert absorption, Henyey-Greenstein volume scattering, nested media, Russian roulette. Wavelength is traced per ray, so
   colour mixing and dispersion of scattering come out of the same run.
 - LEDs: datasheet model (flux, spectrum, angular pattern, emitting area) per channel, or a measured text ray list.
-- Diffuser: TiO2 in PC from Mie theory (particle size and loading), or fitted to a datasheet transmission and haze of a plaque.
-- Exit surface: flat projection, or unwrapped (least squares conformal map) when strongly curved.
+- Diffuser: TiO2 in PC from Mie theory (loading, median particle size 0.3 um and size spread 1.3 by default), or fitted to a
+  datasheet transmission and haze of a plaque. Mie theory describes an ideally dispersed filler, so a real compound usually scatters
+  less: the *dispersion efficiency* of the material scales the scattering coefficient (1 = ideal; try 0.3 to 0.7 and set it from one
+  measured part). Loadings are small for a light pipe: the built-in materials start at 0.001 wt% and the Live slider at 0.0005 wt%.
+  Volume-scattering events have their own cap per ray (20,000), apart from the 500 surface-hit limit (*max_bounces*), so strongly
+  scattering parts no longer lose light to the bounce limit; very high loadings are slow to trace.
+- Exit surface: flat projection, or unwrapped (least squares conformal map) when strongly curved. The surface area of every map pixel is
+  computed exactly (the exit triangles are clipped against the pixel grid), so the luminance map carries no noise other than that of the rays.
+  The drawn map is smoothed with the *Smoothing* setting of the results (the same as for the statistics; *none* shows the raw pixels).
+- Viewing cone: luminance is the light inside the half angle set on the exit surface. Besides that cone, both solvers tally per pixel the
+  light in six rings of 5° (narrower for a small cone) around it, three inside and three outside, so the *View cone* control of the
+  results shows any angle of that range (about ±15° around the set one) without tracing again; the noise estimate follows. Colour at another
+  angle is taken from the traced cone (the rings keep luminance only), and the *Light path analysis* and the rendered picture stay at the
+  traced cone. Runs made before the rings existed show their traced cone only.
 
 ## Accuracy
 

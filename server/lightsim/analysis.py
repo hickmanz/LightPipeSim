@@ -84,6 +84,7 @@ def save(rdir: Path, scene, used: list, tallies: list, settings: dict, seeds: li
         "channels": [{"key": s.key, "led_id": s.led_id, "channel_id": s.channel_id, "seed": int(seeds[i])} for i, s in enumerate(used)],
         "logEnd": int(ana[0].log_end) if ana else 0,
         "nRays": int(n_rays),
+        "solver": str(settings.get("solver") or "cpu"),  # the solver that traced these rays: they can only be replayed by the same one
         "rrThreshold": float(settings["rr_threshold"]),
         "maxBounces": int(settings["max_bounces"]),
     }

@@ -25,10 +25,13 @@ DEFAULT_ANALYSIS = {
     "roi": [0.0, 0.0, 1.0, 1.0],  # u0, v0, u1, v1 as fractions of the detector map
     "margin": 0.0,  # extra edge margin excluded from the statistics, fraction of the shorter side
     "smooth_px": 1.0,  # Gaussian smoothing (pixels) before min/max and hotspot statistics
+    "map_smooth_px": 1.0,  # Gaussian smoothing (pixels) of the map that is drawn (the raw maps stay available)
+    "noise_target": 0.05,  # relative standard error per pixel that counts as a converged map
     "color_smooth_px": 2.0,  # Gaussian smoothing (pixels) of XYZ before colour statistics
     "hotspot_ratio": 1.25,  # a hotspot is a local maximum this many times above the ROI mean
     "hotspot_radius_mm": 2.0,  # neighbourhood in which a hotspot must be the maximum
     "view": "cone",  # luminance for the viewing cone ("cone") or all directions as exitance ("all")
+    "cone_deg": None,  # half angle (deg) of the viewing cone; None = the angle the run was traced with (other angles need the angle rings, see cone_at)
 }
 
 
@@ -103,10 +106,20 @@ class RunData:
                 if only_led is None or ch["led_id"] == only_led
             )
         )
+        def var(name: str) -> np.ndarray | None:
+            """Variance of the luminous tally (runs from before the noise estimate was added have none)."""
+            if name not in a:
+                return None
+            return np.tensordot(wch**2, a[name], axes=(0, 0)) * spectral.KM**2
+
         return {
+            "ex_var": var("ex2"),
+            "cone_var": var("cone2"),
             "ex": comb("ex", spectral.KM),
             "cone": comb("cone", spectral.KM),
             "dirh": comb("dirh", spectral.KM),
+            "ring": comb("ring", spectral.KM) if "ring" in a else None,  # (pixels, NRING) luminous weight in the angle rings around the cone
+            "ring_var": var("ring2"),
             "det_pow": comb("det_pow"),
             "abs_vol": comb("abs_vol"),
             "abs_surf": comb("abs_surf"),
@@ -122,13 +135,96 @@ class RunData:
         sl = slice(off, off + nu * nv)
         area = self.arrays[f"area_map_{k}"]  # (nv, nu) mm^2
         ex = comb["ex"][sl].reshape(nv, nu, 3)
-        cone = comb["cone"][sl].reshape(nv, nu, 3)
-        sin2 = np.sin(np.radians(det["cone_deg"])) ** 2
+        cone_xyz, cone_var, cone_deg = self.cone_at(comb, k, analysis.get("cone_deg"))
+        cone = cone_xyz.reshape(nv, nu, 3)
+        sin2 = np.sin(np.radians(cone_deg)) ** 2
         with np.errstate(divide="ignore", invalid="ignore"):
             a_m2 = area * 1e-6
             lum = np.where(a_m2 > 0, cone[..., 1] / (a_m2 * np.pi * sin2), 0.0)  # cd/m2
             exitance = np.where(a_m2 > 0, ex[..., 1] / a_m2, 0.0)  # lm/m2
-        return {"ex": ex, "cone": cone, "lum": lum, "exitance": exitance, "area": area}
+        noise = None
+        cone_view = analysis.get("view", "cone") == "cone"
+        var = cone_var if cone_view else (comb["ex_var"][sl] if comb.get("ex_var") is not None else None)
+        if var is not None:
+            y = (cone if cone_view else ex)[..., 1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                noise = np.where(y > 0, np.sqrt(var.reshape(nv, nu)) / y, 1.0)  # no light in a lit pixel: 100 % noise
+            noise = np.where(area > 0, np.minimum(noise, 1.0), 0.0)
+        return {"ex": ex, "cone": cone, "lum": lum, "exitance": exitance, "area": area, "noise": noise, "coneDeg": cone_deg}
+
+    # -- the viewing cone at another angle ---------------------------------------------------------------
+    def ring_edges(self, det: dict) -> np.ndarray | None:
+        """Edge angles (deg) of the angle rings of an exit surface, or None for a run made without them."""
+        if "ring" not in self.arrays:
+            return None
+        e = det.get("ring_deg")
+        if not e:
+            from .engine.scene import ring_edges_deg
+
+            return ring_edges_deg(float(det["cone_deg"]))
+        return np.asarray(e, dtype=np.float64)
+
+    def cone_range(self, det: dict) -> list[float] | None:
+        """The smallest and largest cone angle (deg) that can be shown for an exit surface (None: only the traced one)."""
+        e = self.ring_edges(det)
+        if e is None or e[-1] - e[0] < 1e-6:
+            return None
+        return [_f(e[0], 3), _f(e[-1], 3)]
+
+    def cone_at(self, comb: dict, k: int, theta: float | None) -> tuple[np.ndarray, np.ndarray | None, float]:
+        """XYZ (pixels, 3), variance of Y (pixels,) and the effective half angle of the viewing cone of exit surface ``k`` at ``theta`` degrees.
+
+        The run tallied the light up to the set angle (edge 3) and, per pixel, the light in six rings around it. The light up to any
+        edge is the cone tally plus (outside) or minus (inside) the rings in between; between two edges the flux is interpolated
+        linearly in sin^2 (exact for a Lambertian exit). The angle is limited to the ringed range. The colour is that of the cone
+        (of the whole exit where the cone is empty): the rings keep luminance only.
+        """
+        det = self.scene["detectors"][k]
+        sl = slice(det["offset"], det["offset"] + det["nu"] * det["nv"])
+        cone = comb["cone"][sl]
+        var = comb["cone_var"][sl] if comb.get("cone_var") is not None else None
+        t0 = float(det["cone_deg"])
+        edges = self.ring_edges(det)
+        ring = comb.get("ring")
+        if theta is None or edges is None or ring is None:
+            return cone, var, t0
+        th = float(np.clip(theta, edges[0], edges[-1]))
+        if abs(th - t0) < 1e-9:
+            return cone, var, t0
+        ry = ring[sl]
+        n = len(cone)
+        flux = np.zeros((n, 7))
+        flux[:, 3] = cone[:, 1]
+        for e in range(3, 6):
+            flux[:, e + 1] = flux[:, e] + ry[:, e]
+        for e in range(2, -1, -1):
+            flux[:, e] = flux[:, e + 1] - ry[:, e]
+        rv = comb.get("ring_var")
+        vv = None
+        if var is not None and rv is not None:
+            rv = rv[sl]
+            vv = np.zeros((n, 7))
+            vv[:, 3] = var
+            for e in range(3, 6):
+                vv[:, e + 1] = vv[:, e] + rv[:, e]
+            for e in range(2, -1, -1):
+                vv[:, e] = vv[:, e + 1] - rv[:, e]
+        s = np.sin(np.radians(edges)) ** 2
+        sx = float(np.sin(np.radians(th)) ** 2)
+        i = int(np.clip(np.searchsorted(s, sx, side="right") - 1, 0, 5))
+        f = 1.0 if s[i + 1] <= s[i] else float(np.clip((sx - s[i]) / (s[i + 1] - s[i]), 0.0, 1.0))
+        y = np.maximum(flux[:, i] * (1.0 - f) + flux[:, i + 1] * f, 0.0)
+        v = np.maximum(vv[:, i] * (1.0 - f) + vv[:, i + 1] * f, 0.0) if vv is not None else None
+        xyz = np.zeros((n, 3))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            own = cone[:, 1] > 0
+            xyz[own] = cone[own] * (y[own] / cone[own, 1])[:, None]
+            rest = ~own
+            if rest.any():  # nothing in the traced cone: take the colour of the whole exit
+                ex = comb["ex"][sl]
+                ok = rest & (ex[:, 1] > 0)
+                xyz[ok] = ex[ok] * (y[ok] / ex[ok, 1])[:, None]
+        return xyz, v, th
 
     def roi_mask(self, area: np.ndarray, analysis: dict) -> np.ndarray:
         nv, nu = area.shape
@@ -220,7 +316,9 @@ class RunData:
             "areaMm2": _f(det["area_total"], 3),
             "uExtentMm": _f(det["ext"][1] - det["ext"][0], 3),
             "vExtentMm": _f(det["ext"][3] - det["ext"][2], 3),
-            "coneDeg": det["cone_deg"],
+            "coneDeg": _f(maps["coneDeg"], 3),  # the viewing cone of the maps (the traced one unless another angle was asked for)
+            "tracedConeDeg": det["cone_deg"],
+            "coneRange": self.cone_range(det),  # the angles the cone can be set to without tracing again (None: only the traced one)
             "exitLm": _f(exit_lm),
             "efficiency": _f(exit_lm / comb["flux_lm"]) if comb["flux_lm"] > 0 else 0.0,
             "efficiencyRadiometric": _f(exit_w / comb["flux_w"]) if comb["flux_w"] > 0 else 0.0,
@@ -229,6 +327,10 @@ class RunData:
         }
         res["luminance"] = _arr(maps["lum"], 3)
         res["exitance"] = _arr(maps["exitance"], 3)
+        # the map to draw: the active quantity, smoothed like the statistics are (the raw maps above are unchanged)
+        res["map"] = _arr(_smooth(base, area > 0, float(an["map_smooth_px"])), 3)
+        res["mapSmoothPx"] = float(an["map_smooth_px"])
+        res["noise"] = self._noise_summary(maps["noise"], mask, float(an["noise_target"]), max(nu, nv))
         res["mask"] = mask.astype(int).tolist()
         res["valid"] = (area > 0.3 * np.median(area[area > 0])).astype(int).tolist() if (area > 0).any() else [[0] * nu for _ in range(nv)]
 
@@ -311,10 +413,24 @@ class RunData:
                 "shareOfExit": _f(led_exit / exit_lm) if exit_lm > 0 else 0.0,
             }
             if with_led_maps and c2["flux_lm"] > 0:
-                item["map"] = _arr(m2[key], 3)
+                item["map"] = _arr(_smooth(m2[key], area > 0, float(an["map_smooth_px"])), 3)
             leds.append(item)
         res["leds"] = leds
         return res
+
+    def _noise_summary(self, noise: np.ndarray | None, mask: np.ndarray, target: float, long_side: int) -> dict | None:
+        """How noisy the drawn map is: relative standard error per pixel of the Monte Carlo estimate, over the ROI."""
+        if noise is None or not mask.any():
+            return None
+        v = noise[mask]
+        med, p90 = float(np.median(v)), float(np.percentile(v, 90))
+        rays = int(self.arrays["n_rays"].max()) if len(self.arrays["n_rays"]) else 0
+        out = {"median": _f(med, 4), "p90": _f(p90, 4), "target": target, "raysPerChannel": rays, "converged": bool(med <= target)}
+        if med > target > 0:
+            # the error of a pixel falls as 1 / sqrt(rays) and grows in proportion to the number of pixels along a side
+            out["raysForTarget"] = int(np.ceil(rays * (med / target) ** 2))
+            out["resolutionForTarget"] = max(8, int(long_side * target / med))
+        return out
 
     def _leds(self) -> list[tuple[str, str]]:
         seen: dict[str, str] = {}

@@ -16,6 +16,14 @@ from ..engine import spectral
 RHO_TIO2 = 4.23  # g/cm^3 (rutile)
 RHO_HOSTS = {"pc": 1.20, "pmma": 1.18, "silicone": 1.05, "epoxy": 1.15}
 
+# Defaults for a realistic dispersion, shared by the library presets, sweeps, the editor and the calculator. Ideal
+# monodisperse 0.25 um spheres sit at the peak of scattering per gram and overestimate a real compound; a median size
+# of 0.3 um with a geometric spread of 1.3 is closer to a dispersed pigment (still an ideal-dispersion estimate:
+# agglomerates scatter less, which the ``efficiency`` factor of the scattering block can account for).
+DEFAULT_DIAMETER_UM = 0.3
+DEFAULT_SIGMA_G = 1.3
+DEFAULT_EFFICIENCY = 1.0
+
 
 def rutile_index(lam_nm: np.ndarray) -> np.ndarray:
     """Orientation averaged refractive index of rutile (DeVore 1951 ordinary and extraordinary dispersion)."""
@@ -67,12 +75,19 @@ def scattering_curves(
     host: str | dict | float = "pc",
     sigma_g: float = 1.0,
     dependent_scattering: bool = True,
+    efficiency: float = DEFAULT_EFFICIENCY,
 ) -> dict[str, np.ndarray]:
-    """mu_s, g, mu_s' (reduced) and Qsca on the 5 nm grid."""
+    """mu_s, g, mu_s' (reduced) and Qsca on the 5 nm grid.
+
+    ``efficiency`` scales mu_s (not g): 1 is an ideal dispersion of spheres, less than 1 stands for agglomeration and
+    other losses of scattering power per gram of filler, found by calibrating against one real measurement.
+    """
     import miepython
 
     if diameter_um <= 0:
         raise ValueError("particle diameter must be > 0")
+    if not 0.0 <= float(efficiency) <= 10.0:
+        raise ValueError("dispersion efficiency must be between 0 and 10")
     lam = spectral.LAM
     nh = host_index(host, lam)
     npart = rutile_index(lam)
@@ -100,15 +115,18 @@ def scattering_curves(
     if dependent_scattering:
         # crowding reduces the scattering of each particle; Percus-Yevick-like factor, small below 1 vol%
         mus = mus * (1.0 - phi) ** 2 / (1.0 + 2.0 * phi) ** 1
+    mus = mus * float(efficiency)
     return {"lambda": lam.copy(), "mus": mus, "g": g, "mus_reduced": mus * (1.0 - g), "qsca": qs, "volume_fraction": np.array([phi])}
 
 
 def scattering_from_params(sc: dict) -> tuple[np.ndarray, np.ndarray]:
     """Resolve a ``{"type": "mie", ...}`` scattering block of a library material to (mu_s, g)."""
+    eff = sc.get("efficiency")
     cur = scattering_curves(
         wt_pct=float(sc["tio2_wt_pct"]),
-        diameter_um=float(sc.get("diameter_um", 0.25)),
+        diameter_um=float(sc.get("diameter_um", DEFAULT_DIAMETER_UM)),
         host=sc.get("host", "pc"),
-        sigma_g=float(sc.get("sigma_g", 1.0)),
+        sigma_g=float(sc.get("sigma_g", DEFAULT_SIGMA_G)),
+        efficiency=DEFAULT_EFFICIENCY if eff in (None, "") else float(eff),
     )
     return cur["mus"], cur["g"]

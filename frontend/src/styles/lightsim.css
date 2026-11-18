@@ -62,6 +62,11 @@
 .mini.narrow {
   width: 120px;
 }
+.mini .cone-range {
+  width: 110px;
+  padding: 0;
+  accent-color: var(--accent-9);
+}
 .inline {
   display: flex;
   align-items: center;

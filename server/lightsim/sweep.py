@@ -16,6 +16,7 @@ import copy
 import re
 
 from .engine.scene import name_matches, resolve_part
+from .materials import mie
 
 PARAMETERS = {
     "tio2_wt_pct": {"label": "TiO2 loading", "unit": "wt %", "min": 0.0, "max": 60.0},
@@ -70,7 +71,14 @@ def build_variants(setup: dict, library: dict, instances: list[dict], spec: dict
         sc = dict(doc.get("scattering") or {"type": "none"})
         if param in ("tio2_wt_pct", "diameter_um"):
             if sc.get("type") != "mie":
-                sc = {"type": "mie", "tio2_wt_pct": 0.0, "diameter_um": 0.25, "sigma_g": 1.3, "host": "pc"}
+                sc = {
+                    "type": "mie",
+                    "tio2_wt_pct": 0.0,
+                    "diameter_um": mie.DEFAULT_DIAMETER_UM,
+                    "sigma_g": mie.DEFAULT_SIGMA_G,
+                    "host": "pc",
+                    "efficiency": mie.DEFAULT_EFFICIENCY,
+                }
             sc["tio2_wt_pct" if param == "tio2_wt_pct" else "diameter_um"] = v
         else:  # mus
             g = float(sc.get("g", 0.6)) if sc.get("type") == "constant" else 0.6

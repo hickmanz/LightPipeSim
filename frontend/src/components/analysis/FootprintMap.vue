@@ -4,7 +4,7 @@
       <strong class="fp-title">{{ what }}</strong>
       <span class="muted small">{{ share }}</span>
       <span class="spacer" />
-      <div v-if="modes" class="seg" role="group" aria-label="Which light">
+      <div v-if="modes && !direct" class="seg" role="group" aria-label="Which light">
         <button :class="{ on: mode === 'last' }" title="Light whose last bounce on one of your surfaces was this one" @click="mode = 'last'">Left it last</button>
         <button :class="{ on: mode === 'touched' }" title="Light that hit this surface at some point on its way" @click="mode = 'touched'">Touched it</button>
       </div>
@@ -21,10 +21,10 @@
     />
     <div v-else-if="loading" class="muted small"><div class="spinner small" /> Loading…</div>
     <p v-if="map && tiny" class="muted small">
-      Only a little of the exit light {{ mode === "touched" || kind === "family" ? "comes this way" : "leaves this surface last" }}.
+      Only a little of the exit light {{ direct ? "comes straight from the LED" : mode === "touched" || kind === "family" ? "comes this way" : "leaves this surface last" }}.
       <template v-if="!sameScale">The colours are stretched to this map's own brightest spot, so read the numbers on the scale, not the colours.</template>
       <template v-else>With the exit map's scale it is faint by design.</template>
-      <template v-if="kind === 'group' && mode === 'last'"> “Touched it” also counts light that bounced off it earlier.</template>
+      <template v-if="kind === 'group' && mode === 'last' && !direct"> “Touched it” also counts light that bounced off it earlier.</template>
     </p>
     <div class="fp-foot">
       <label class="check small" title="Off: the colours are stretched so the brightest spot of this map is red. On: the same colours as the exit map, so you can compare brightness directly.">
@@ -62,8 +62,13 @@ const sameScale = ref(false);
 const map = ref<AnalysisMap | null>(null);
 const loading = ref(false);
 
+/** "Straight from the LED" (group -1) touched no surface, so only the "left it last" view exists for it. */
+const direct = computed(() => props.kind === "group" && typeof props.id === "number" && props.id < 0);
+const effMode = computed(() => (direct.value ? "last" : mode.value));
+
 const what = computed(() => {
   if (props.kind === "family") return "Where the light of this route lands";
+  if (direct.value) return "Where the light that comes straight from the LED lands";
   return mode.value === "last" ? "Where the light that left it last lands" : "Where the light that touched it lands";
 });
 const share = computed(() => (map.value ? `${fmtPct(map.value.fraction, map.value.fraction < 0.1 ? 1 : 0)} of the exit light` : ""));
@@ -82,7 +87,7 @@ async function load() {
     const c = props.ctx;
     const m =
       props.kind === "group"
-        ? await api.analysisMap(c.runId, { group: props.id as number, mode: mode.value, state: c.state, view: c.view, detector: c.detector })
+        ? await api.analysisMap(c.runId, { group: props.id as number, mode: effMode.value, state: c.state, view: c.view, detector: c.detector })
         : await api.analysisFamilyMap(c.runId, { family: props.id as string, state: c.state, view: c.view, detector: c.detector });
     if (mine === seq) map.value = m;
   } catch {
@@ -91,7 +96,7 @@ async function load() {
     if (mine === seq) loading.value = false;
   }
 }
-watch(() => [props.kind, props.id, mode.value, props.ctx.runId, props.ctx.state, props.ctx.view, props.ctx.detector], load, { immediate: true });
+watch(() => [props.kind, props.id, effMode.value, props.ctx.runId, props.ctx.state, props.ctx.view, props.ctx.detector], load, { immediate: true });
 </script>
 
 <style scoped>

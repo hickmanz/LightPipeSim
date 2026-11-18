@@ -26,6 +26,13 @@
       </div>
       <div v-if="live.phase.value === 'running'" class="progress thin"><div class="progress-bar" :style="{ width: live.progress.value * 100 + '%' }" /></div>
 
+      <label v-if="live.states.value.length > 1" class="mini" title="Which LEDs are on. The simulation covers every LED, so switching state needs no new run.">
+        <span>State</span>
+        <select :value="live.shownState.value" @change="live.stateId.value = ($event.target as HTMLSelectElement).value">
+          <option v-for="s in live.states.value" :key="s.id" :value="s.id">{{ s.name }}</option>
+        </select>
+      </label>
+
       <div v-if="det" class="live-metrics">
         <div><span class="muted">Efficiency</span><strong>{{ fmtPct(det.efficiency) }}</strong></div>
         <div><span class="muted">Min / max</span><strong>{{ det.stats.minOverMax == null ? "–" : fmtPct(det.stats.minOverMax, 0) }}</strong></div>
@@ -35,6 +42,7 @@
         <div><span class="muted">Exit</span><strong>{{ det.exitLm.toFixed(2) }} lm</strong></div>
       </div>
       <p v-else-if="live.phase.value !== 'error'" class="muted small">The first picture appears after a couple of seconds.</p>
+      <NoiseBadge v-if="det" :noise="det.noise" />
 
       <div v-if="live.diffusers.value.length" class="live-slider">
         <label class="mini">
@@ -64,6 +72,22 @@
         </label>
         <button class="btn small" :disabled="live.phase.value !== 'done'" title="Keep this result as a run in the Run tab" @click="live.keep()"><Save :size="14" /> Keep</button>
       </div>
+      <label v-if="live.gpu.value?.available" class="mini" title="Trace on the GPU: the same physics, many times faster, so a preview sharpens in moments.">
+        <span>Solver</span>
+        <select v-model="live.chosen.value">
+          <option value="cpu">CPU</option>
+          <option value="gpu">GPU ({{ live.gpu.value.name }})</option>
+        </select>
+      </label>
+      <label class="mini" title="Stop tracing before the ray count above once the map is this quiet (relative noise per pixel)">
+        <span>Stop when map noise is below</span>
+        <select v-model.number="live.targetNoise.value">
+          <option :value="0">Off (trace all rays)</option>
+          <option :value="0.1">10 %</option>
+          <option :value="0.05">5 % (converged)</option>
+          <option :value="0.03">3 %</option>
+        </select>
+      </label>
       <p v-if="live.notice.value" class="muted small">{{ live.notice.value }}</p>
 
       <hr />
@@ -117,6 +141,7 @@ import { computed } from "vue";
 import { AlertTriangle, Check, Save, X, Zap } from "lucide-vue-next";
 import { LIVE_RAY_CHOICES, TIO2_RANGE, type LivePreview } from "../composables/useLivePreview";
 import { fmtPct } from "../utils/colormap";
+import NoiseBadge from "./NoiseBadge.vue";
 
 export interface PhotorealView {
   on: boolean;

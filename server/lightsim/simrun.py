@@ -9,7 +9,7 @@ import numpy as np
 
 from . import library as lib
 from . import store
-from .engine import sources, tracer
+from .engine import kernels, solvers, sources, tracer
 from .engine.scene import build_scene
 from .optical_mesh import load_optical
 
@@ -24,7 +24,11 @@ DEFAULT_SETTINGS = {
     "live": False,  # traced in growing passes that are saved as they finish (live preview)
     "analysis": True,  # keep what is needed to see where the light came from (face contributions, ray logs, ray replay)
     "analysis_rays": 2_000_000,  # rays per channel that are logged in detail (the maps always use every ray)
+    "solver": "cpu",  # "cpu" (Embree + Numba) or "gpu" (NVIDIA Warp on CUDA, if installed): same physics, see engine/solvers.py
+    "one_channel_per_led": False,  # quick look: trace only the brightest driven channel of every LED (the others are left out of the result)
+    "target_noise": 0.0,  # > 0: trace in growing passes and stop once the median relative noise per map pixel is below this ("rays" is then the maximum); with "analysis" on, one extra pass over the first "analysis_rays" gives the light path analysis
 }
+FIRST_PASS_RAYS = 250_000  # first pass of a run that stops at a noise target; every later pass doubles the total
 
 
 def effective_states(setup: dict) -> list[dict]:
@@ -61,6 +65,8 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
     for s in states:
         resolved.append({"id": s["id"], "name": s.get("name", s["id"]), "drive": sources.resolve_state_drive(s, srcs)})
     used = [src for src in srcs if any(st["drive"].get(src.key, 0.0) > 0 for st in resolved)]
+    if settings.get("one_channel_per_led"):
+        used = one_channel_per_led(used, resolved)
     if not used:
         raise ValueError("No LED channel is driven in any state")
 
@@ -72,6 +78,10 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
     arr = {
         "ex": np.zeros((nch, scene.total_pix, 3), dtype=np.float64),
         "cone": np.zeros((nch, scene.total_pix, 3), dtype=np.float64),
+        "ex2": np.zeros((nch, scene.total_pix), dtype=np.float64),  # squared luminous deposits: the noise of the maps
+        "cone2": np.zeros((nch, scene.total_pix), dtype=np.float64),
+        "ring": np.zeros((nch, scene.total_pix, kernels.NRING), dtype=np.float64),  # luminous weight in the angle rings around the viewing cone
+        "ring2": np.zeros((nch, scene.total_pix, kernels.NRING), dtype=np.float64),  # ... and the squares of its deposits (noise)
         "dirh": np.zeros((nch, ndet, nth, 3)),
         "det_pow": np.zeros((nch, ndet)),
         "abs_vol": np.zeros((nch, nbody)),
@@ -94,6 +104,7 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
             {
                 "id": d.id, "name": d.name, "origin": d.origin.tolist(), "u": d.u.tolist(), "v": d.v.tolist(), "n": d.n.tolist(),
                 "ext": d.ext.tolist(), "nu": int(d.nu), "nv": int(d.nv), "offset": int(d.offset), "cone_deg": float(d.cone_deg),
+                "ring_deg": [round(float(e), 6) for e in d.ring_deg],
                 "area_total": float(d.area_total), "corners": d.corners.tolist(),
                 "mode": int(d.mode), **({"mesh": d.mesh} if d.mesh else {}),
             }
@@ -114,15 +125,26 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
     }
 
     live = bool(settings.get("live"))
-    do_analysis = bool(settings.get("analysis", True)) and not live
+    target = float(settings.get("target_noise") or 0.0)
+    until_noise = target > 0  # traced in growing passes until the maps are quiet enough (or "rays" is reached)
+    analysis_wanted = bool(settings.get("analysis", True)) and not live
+    log_rays = int(settings.get("analysis_rays", 2_000_000))
+    solver_name = str(settings.get("solver") or "cpu")
+    solver = solvers.get_solver(solver_name)
+    # The GPU solver is fast enough to keep the analysis of every pass (the tables and maps take every ray, the logs the first
+    # "analysis_rays"; the passes are merged). The CPU solver is 40 % slower with the analysis on: a CPU run that may stop early
+    # gets it from one extra pass over its first rays when it is done (see below) instead of during the growing passes.
+    do_analysis = analysis_wanted and (solver_name == "gpu" or not until_noise)
+    final_analysis = analysis_wanted and until_noise and solver_name == "cpu"
     # a live run is traced in growing passes and saved after each one, so that its results can be looked at while it runs
     sizes: list[int] = []
-    if live:
-        first = max(2000, min(n_rays, 4000))
+    if live or until_noise:
+        first = max(2000, min(n_rays, 4000)) if live else min(n_rays, FIRST_PASS_RAYS)
         while sum(sizes) < n_rays:
             sizes.append(min(first * 2 ** len(sizes), n_rays - sum(sizes)))
     else:
         sizes = [n_rays]
+    noise_now = None
 
     paths_out: list[dict] = []
     tallies: list = [None] * nch
@@ -141,16 +163,24 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
                 frac = (done_rays + (i + f) / nch * size) / n_rays
                 progress(f"Tracing {src.led_name} / {src.channel_name} ({i + 1}/{nch}), {int(done_rays + f * size):,} of {n_rays:,} rays each", frac)
 
-            tl = tracer.trace_channel(
+            tl = solver.trace_channel(
                 scene, src, size, seed=seeds[i], start=done_rays,
                 rr_threshold=float(settings["rr_threshold"]), max_bounces=int(settings["max_bounces"]),
                 theta_bins=nth, record_paths=want_paths, max_path_points=int(settings["max_path_points"]),
-                progress=prog, analysis=do_analysis, log_rays=int(settings.get("analysis_rays", 2_000_000)),
+                progress=prog, analysis=do_analysis, log_rays=log_rays,
             )
+            if tallies[i] is not None and tallies[i].analysis is not None and tl.analysis is not None:
+                _merge_analysis(tallies[i].analysis, tl.analysis)  # the next pass of the same channel: the logs and tables add up
+                tl.analysis = tallies[i].analysis
             tallies[i] = tl
             steps += tl.steps
             arr["ex"][i] += tl.ex
             arr["cone"][i] += tl.cone
+            arr["ex2"][i] += tl.ex2
+            arr["cone2"][i] += tl.cone2
+            if tl.ring is not None:
+                arr["ring"][i] += tl.ring
+                arr["ring2"][i] += tl.ring2
             arr["dirh"][i] += tl.dirh
             arr["det_pow"][i] += tl.det_pow
             arr["abs_vol"][i] += tl.abs_vol
@@ -170,6 +200,32 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
             arr["flux_lm"][i] = src.flux_lm
         if live:
             _save_partial(rdir, arr, scene_doc, paths_out, done_rays, n_rays, first=(pass_no == 0))
+        if until_noise:
+            noise_now = median_map_noise(arr, scene, used, resolved[0]["drive"])
+            progress(f"Traced {done_rays:,} rays per channel, map noise {noise_now * 100:.1f} % (target {target * 100:.1f} %)", min(done_rays / n_rays, 0.98))
+            if noise_now <= target:
+                break
+
+    if final_analysis:
+        # Trace the first rays of every channel once more, now with analysis. A ray depends only on its number and the
+        # channel's seed, so these are the very rays already in the maps. The tables are summed over fewer rays than the
+        # maps, so they are scaled up to the same footing (an unbiased, noisier estimate); the ray logs are not scaled.
+        m = min(done_rays, log_rays)
+        scale = done_rays / m
+        for i, src in enumerate(used):
+
+            def prog_a(f: float, i=i, src=src) -> None:
+                progress(f"Analysis pass: {src.led_name} / {src.channel_name} ({i + 1}/{nch}), {m:,} rays", 0.98 + 0.01 * (i + f) / nch)
+
+            tl = tracer.trace_channel(
+                scene, src, m, seed=seeds[i], start=0,
+                rr_threshold=float(settings["rr_threshold"]), max_bounces=int(settings["max_bounces"]),
+                theta_bins=nth, progress=prog_a, analysis=True, log_rays=log_rays,
+            )
+            a = tl.analysis
+            for name in ("face_t", "face_from", "face_to", "grp_map", "touch_map", "tot_map"):
+                setattr(a, name, getattr(a, name) * scale)
+            tallies[i] = tl
 
     progress("Saving results", 0.99)
     arr["accounted"] = arr["accounted"] / done_rays
@@ -177,19 +233,25 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
     store.write_json(rdir / "scene.json", scene_doc)
     store.write_json(rdir / "paths.json", {"paths": paths_out})
     analysis_warning = None
-    if do_analysis:
+    if analysis_wanted:
         progress("Saving analysis", 0.995)
         try:
             from . import analysis
 
-            analysis.save(rdir, scene, used, tallies, settings, seeds, n_rays)
+            analysis.save(rdir, scene, used, tallies, settings, seeds, done_rays)
         except Exception as exc:  # the results are complete without it
             analysis_warning = f"The analysis data could not be saved: {exc}"
     run = store.load_run(rid, runid) or {}
     elapsed = time.time() - t_start
-    run["timing"] = {"seconds": round(elapsed, 2), "raysTotal": n_rays * nch, "raysPerSecond": round(n_rays * nch / max(elapsed, 1e-9))}
+    run["timing"] = {"seconds": round(elapsed, 2), "raysTotal": done_rays * nch, "raysPerSecond": round(done_rays * nch / max(elapsed, 1e-9))}
+    run["solver"] = solver_name
+    if solver_name == "gpu":
+        run["solverName"] = solvers.gpu_status()[1]
+    run["raysTraced"] = int(done_rays)  # less than settings.rays when the run stopped at its noise target
+    if noise_now is not None:
+        run["mapNoise"] = round(float(noise_now), 4)
     run["warnings"] = list(scene.warnings) + ([analysis_warning] if analysis_warning else [])
-    run["hasAnalysis"] = bool(do_analysis and not analysis_warning)
+    run["hasAnalysis"] = bool(analysis_wanted and not analysis_warning)
     run["maxAccountingError"] = float(np.max(np.abs(arr["accounted"] - 1.0)))
     store.save_run(rid, runid, run)
     # summary (needs the saved files)
@@ -199,6 +261,57 @@ def run_simulation(rid: str, runid: str, progress: Callable[[str, float], None])
     run["summary"] = RunData.load(rid, runid).summary()
     store.save_run(rid, runid, run)
     progress("Done", 1.0)
+
+
+def _merge_analysis(a, b) -> None:
+    """Add the analysis of a later pass (b) of a channel to that of the earlier passes (a)."""
+    for name in ("face_t", "face_from", "face_to", "grp_map", "touch_map", "tot_map"):
+        setattr(a, name, getattr(a, name) + getattr(b, name))
+    for kind in ("dep", "end"):
+        la, lb = getattr(a, kind), getattr(b, kind)
+        if lb:
+            setattr(a, kind, {k: np.concatenate([la[k], lb[k]]) for k in lb} if la else lb)
+
+
+def one_channel_per_led(used: list, resolved: list[dict]) -> list:
+    """Keep only the channel that carries the most light of each LED (luminous flux times the drive it gets over all states).
+
+    The other channels are not traced at all, so the result shows the spread of that one channel's light: right for judging how the
+    light is distributed, not for colour or absolute luminance. The order of the channels is kept.
+    """
+    best: dict[str, tuple[float, object]] = {}
+    for src in used:
+        score = float(src.flux_lm) * sum(float(st["drive"].get(src.key, 0.0)) for st in resolved)
+        cur = best.get(src.led_id)
+        if cur is None or score > cur[0]:
+            best[src.led_id] = (score, src)
+    keep = {id(s) for _, s in best.values()}
+    return [s for s in used if id(s) in keep]
+
+
+def median_map_noise(arr: dict, scene, used: list, drive: dict) -> float:
+    """Median relative standard error per exit-map pixel (viewing cone) of one state: the number a noise target is checked against.
+
+    Pixels with too little surface in them (the edge of the exit face) are left out; a lit pixel that has caught no ray yet counts as 100 %.
+    """
+    wch = arr["w0"] * np.array([float(drive.get(s.key, 0.0)) for s in used])
+    if not (wch > 0).any():
+        return 1.0
+    y = np.tensordot(wch, arr["cone"][..., 1], axes=(0, 0))
+    var = np.tensordot(wch**2, arr["cone2"], axes=(0, 0))
+    worst = 0.0
+    for det in scene.detectors:
+        sl = slice(det.offset, det.offset + det.nu * det.nv)
+        area = det.area_map.reshape(-1)
+        pos = area > 0
+        if not pos.any():
+            continue
+        valid = area > 0.3 * np.median(area[pos])
+        yy, vv = y[sl], var[sl]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = np.where(yy > 0, np.sqrt(vv) / yy, 1.0)
+        worst = max(worst, float(np.median(np.minimum(rel[valid], 1.0))))
+    return worst
 
 
 def _save_partial(rdir, arr: dict, scene_doc: dict, paths_out: list, done: int, total: int, first: bool) -> None:

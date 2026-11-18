@@ -237,6 +237,12 @@ export interface RunSettings {
   /** Keep the data of the light path analysis (default on) and for how many rays per channel (default 2,000,000). */
   analysis?: boolean;
   analysis_rays?: number;
+  /** Stop before `rays` once the median relative noise per map pixel is below this (e.g. 0.05); with `analysis: true` one final pass over the first `analysis_rays` provides the light path analysis. */
+  target_noise?: number;
+  /** Quick look: trace only the brightest driven channel of every LED (shows the spread of the light, not colour or absolute luminance). */
+  one_channel_per_led?: boolean;
+  /** "cpu" (default) or "gpu" (NVIDIA Warp on CUDA; see `api.solvers`). */
+  solver?: "cpu" | "gpu";
 }
 export interface RunSummaryState {
   id: string;
@@ -279,6 +285,14 @@ export interface RenderState {
     info?: { warnings: string[]; state: string; size: number[] };
   };
 }
+export interface SolverInfo {
+  id: "cpu" | "gpu";
+  available: boolean;
+  /** The device (GPU) or the engine (CPU). */
+  name: string | null;
+  /** Why it is not available. */
+  reason: string | null;
+}
 export interface RunMeta {
   id: string;
   revisionId: string;
@@ -290,6 +304,13 @@ export interface RunMeta {
   settings: RunSettings;
   progress: Progress;
   timing?: { seconds: number; raysTotal: number; raysPerSecond: number };
+  /** Rays per channel actually traced (less than `settings.rays` when the run stopped at its noise target). */
+  /** The solver that traced the run, and the GPU's name when it was the GPU. */
+  solver?: "cpu" | "gpu";
+  solverName?: string;
+  raysTraced?: number;
+  /** Median relative noise per map pixel when the run stopped at a noise target. */
+  mapNoise?: number;
   warnings?: string[];
   maxAccountingError?: number;
   /** True when the run kept the data of the light path analysis. */
@@ -344,9 +365,24 @@ export interface Analysis {
   roi?: [number, number, number, number];
   margin?: number;
   smooth?: number;
+  /** Gaussian smoothing (pixels) of the map that is drawn; the statistics use `smooth`. */
+  map_smooth?: number;
   hotspot_ratio?: number;
   hotspot_mm?: number;
   view?: "cone" | "all";
+  /** Half angle (deg) of the viewing cone; absent = the angle the run was traced with. Limited per exit surface to `DetectorResult.coneRange`. */
+  cone_deg?: number;
+}
+/** How noisy the Monte Carlo map is: relative standard error per pixel over the region of interest. */
+export interface MapNoise {
+  median: number;
+  p90: number;
+  target: number;
+  raysPerChannel: number;
+  converged: boolean;
+  /** Only when the map is noisier than the target: what it would take to get there. */
+  raysForTarget?: number;
+  resolutionForTarget?: number;
 }
 export interface Hotspot {
   u: number;
@@ -371,7 +407,12 @@ export interface DetectorResult {
   areaMm2: number;
   uExtentMm: number;
   vExtentMm: number;
+  /** The viewing cone of the luminance maps: the traced one unless another angle was asked for (`Analysis.cone_deg`). */
   coneDeg: number;
+  /** The viewing cone the run was traced with (the one set on the exit surface). */
+  tracedConeDeg?: number;
+  /** The smallest and largest cone angle that can be shown without tracing again; null/absent for runs made before the angle rings existed. */
+  coneRange?: [number, number] | null;
   exitLm: number;
   efficiency: number;
   efficiencyRadiometric: number;
@@ -379,6 +420,11 @@ export interface DetectorResult {
   unit: string;
   luminance: number[][];
   exitance: number[][];
+  /** The active quantity, smoothed by `mapSmoothPx` for drawing (absent in results from older servers). */
+  map?: number[][];
+  mapSmoothPx?: number;
+  /** Absent for runs made before the noise estimate existed. */
+  noise?: MapNoise | null;
   mask: number[][];
   valid: number[][];
   stats: {
@@ -783,9 +829,11 @@ export function analysisParams(a?: Analysis): Record<string, string | number | u
     roi: a.roi ? a.roi.join(",") : undefined,
     margin: a.margin,
     smooth: a.smooth,
+    map_smooth: a.map_smooth,
     hotspot_ratio: a.hotspot_ratio,
     hotspot_mm: a.hotspot_mm,
     view: a.view,
+    cone_deg: a.cone_deg,
   };
 }
 
@@ -881,7 +929,7 @@ export const api = {
   exportUrl: (id: string) => `/api/runs/${id}/export.zip`,
 
   // live preview
-  startLive: (rid: string, body: { setup?: Setup | null; rays?: number; overrides?: LiveOverride[]; max_resolution?: number }) => post<RunMeta>(`/api/revisions/${rid}/live`, body),
+  startLive: (rid: string, body: { setup?: Setup | null; rays?: number; overrides?: LiveOverride[]; max_resolution?: number; target_noise?: number; solver?: "cpu" | "gpu" }) => post<RunMeta>(`/api/revisions/${rid}/live`, body),
   getLive: (rid: string) => request<{ run: RunMeta | null }>(`/api/revisions/${rid}/live`),
   keepLive: (runid: string) => post<RunMeta>(`/api/runs/${runid}/keep`),
   closeLiveView: () => post<{ ok: boolean }>("/api/live-view/close"),
@@ -904,9 +952,10 @@ export const api = {
 
   // library
   library: () => request<Library>("/api/library"),
+  solvers: () => request<{ solvers: SolverInfo[] }>("/api/solvers"),
   saveLibraryEntry: <T>(kind: LibraryKind, doc: unknown) => post<T>(`/api/library/${kind}`, doc),
   deleteLibraryEntry: (kind: LibraryKind, id: string) => request<{ ok: boolean }>(`/api/library/${kind}/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  mie: (body: { tio2_wt_pct: number; diameter_um: number; host: string; sigma_g: number; thickness_mm: number }) => post<MieResult>("/api/diffuser/mie", body),
+  mie: (body: { tio2_wt_pct: number; diameter_um: number; host: string; sigma_g: number; efficiency: number; thickness_mm: number }) => post<MieResult>("/api/diffuser/mie", body),
   fitDiffuser: (body: { samples: FitSample[]; host: string; rays?: number }) => post<FitResult>("/api/diffuser/fit", body),
 
   // app

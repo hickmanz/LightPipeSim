@@ -52,7 +52,7 @@ def build_segments(ra, scene, srcs, state: str, count: int, seed: int, max_point
             ids = np.sort(rng.choice(n_rays, size=n_c, replace=False)) if n_c < n_rays else np.arange(n_rays)
             scale = wch[ci] * (n_rays / n_c) / flux_w  # one sampled ray stands for n_rays/n_c rays of this channel
             for a in range(0, n_c, CHUNK):
-                _, buf, pn, aux = replay_arrays(scene, srcs[meta["key"]], meta["seed"], ids[a:a + CHUNK], ra.meta["rrThreshold"], ra.meta["maxBounces"], max_points)
+                _, buf, pn, aux = replay_arrays(scene, srcs[meta["key"]], meta["seed"], ids[a:a + CHUNK], ra.meta["rrThreshold"], ra.meta["maxBounces"], max_points, ra.meta.get("solver", "cpu"))
                 m = len(buf)
                 used += m
                 ev = aux[:, :, 1]

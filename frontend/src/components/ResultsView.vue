@@ -20,7 +20,13 @@
           <option value="all">Exitance (all directions)</option>
         </select>
       </label>
-      <label class="mini inline" title="Gaussian smoothing before min / max / hotspot statistics">
+      <label v-if="analysis.view === 'cone' && det" class="mini inline cone-ctl" :title="coneTitle">
+        <span>View cone</span>
+        <input v-if="coneRange" type="range" class="cone-range" :min="coneRange[0]" :max="coneRange[1]" step="1" :value="coneShown" @input="onCone(($event.target as HTMLInputElement).value)" />
+        <span class="muted">{{ coneShown.toFixed(coneShown % 1 ? 1 : 0) }}°<template v-if="!coneRange"> (as traced)</template></span>
+        <button v-if="coneRange && analysis.cone_deg !== null" type="button" class="tbtn" title="Back to the viewing cone the run was traced with" @click="analysis.cone_deg = null">reset</button>
+      </label>
+      <label class="mini inline" title="Gaussian smoothing of the drawn maps and before the min / max / hotspot statistics. Choose none to see the raw Monte Carlo pixels.">
         <span>Smoothing</span>
         <select v-model.number="analysis.smooth">
           <option :value="0">none</option>
@@ -78,14 +84,15 @@
         </div>
       </div>
 
-      <div v-if="noisy" class="notice info"><Info :size="15" /><span>Only {{ result.rays.toLocaleString() }} rays per channel were used: maps and colour are noisy. Run again with more rays for smooth results.</span></div>
+      <NoiseBadge v-if="det.noise" class="noise-row" :noise="det.noise" />
+      <div v-else-if="noisy" class="notice info"><Info :size="15" /><span>Only {{ result.rays.toLocaleString() }} rays per channel were used: maps and colour are noisy. Run again with more rays for smooth results.</span></div>
       <div v-for="w in result.warnings" :key="w" class="notice warn"><AlertTriangle :size="15" /><span>{{ w }}</span></div>
 
       <!-- maps -->
       <section class="res-card">
         <HeatMap
           :title="`${det.quantity === 'luminance' ? 'Luminance' : 'Exitance'} at the exit surface — ${det.name}`"
-          :values="det[det.quantity === 'luminance' ? 'luminance' : 'exitance']"
+          :values="det.map ?? det[det.quantity === 'luminance' ? 'luminance' : 'exitance']"
           :valid="det.valid"
           :vmin="logScale ? mapMax * 0.001 : 0"
           :vmax="mapMax"
@@ -99,6 +106,7 @@
           @roi="setRoi"
         />
         <p class="muted small">Drag on the map to analyse a region, double-click to reset. {{ roiText }}</p>
+        <p v-if="coneChanged" class="muted small">Showing the {{ det.coneDeg }}° viewing cone (traced with {{ det.tracedConeDeg }}°): luminance and noise are exact, colour is taken from the traced cone. The light path analysis below still uses the traced cone.</p>
       </section>
 
       <AnalysisPanel v-if="anaCtx" :ctx="anaCtx" />
@@ -175,6 +183,7 @@ import ChromaticityPlot from "./ChromaticityPlot.vue";
 import CompareView from "./CompareView.vue";
 import RenderPanel from "./RenderPanel.vue";
 import AnalysisPanel from "./AnalysisPanel.vue";
+import NoiseBadge from "./NoiseBadge.vue";
 import type { AnalysisCtx } from "../composables/useAnalysisView";
 
 const props = defineProps<{ runId: string }>();
@@ -187,17 +196,33 @@ const loading = ref(false);
 const error = ref("");
 const logScale = ref(false);
 const compareWith = ref<string | null>(null);
-const analysis = reactive<{ view: "cone" | "all"; smooth: number; hotspot_ratio: number; roi: number[] | null }>({ view: "cone", smooth: 1, hotspot_ratio: 1.25, roi: null });
+const analysis = reactive<{ view: "cone" | "all"; smooth: number; hotspot_ratio: number; roi: number[] | null; cone_deg: number | null }>({ view: "cone", smooth: 1, hotspot_ratio: 1.25, roi: null, cone_deg: null });
 
 const apiAnalysis = computed<Analysis>(() => ({
   view: analysis.view,
+  cone_deg: analysis.cone_deg ?? undefined,
   smooth: analysis.smooth,
+  map_smooth: analysis.smooth, // the drawn map is smoothed like the statistics
   hotspot_ratio: analysis.hotspot_ratio,
   roi: analysis.roi ? (analysis.roi as [number, number, number, number]) : undefined,
 }));
 const compareOptions = computed(() => ({ log: logScale.value }));
 
 const det = computed<DetectorResult | null>(() => result.value?.detectors[detIdx.value] ?? null);
+// the viewing cone: the run keeps the light in rings around the traced cone, so the cone can be changed here without tracing again
+const coneRange = computed(() => det.value?.coneRange ?? null);
+const coneShown = computed(() => det.value?.coneDeg ?? det.value?.tracedConeDeg ?? 0);
+const coneChanged = computed(() => !!det.value && det.value.tracedConeDeg !== undefined && Math.abs(det.value.coneDeg - det.value.tracedConeDeg) > 1e-6);
+const coneTitle = computed(() =>
+  coneRange.value
+    ? `Half angle of the viewing cone the luminance is measured in (${coneRange.value[0]}° to ${coneRange.value[1]}°; traced with ${det.value?.tracedConeDeg}°). Applies to every exit surface, limited to the range each one has.`
+    : "Half angle of the viewing cone the luminance is measured in. This run was made without the angle rings (run it again to change the cone here).",
+);
+function onCone(v: string) {
+  const x = Number(v);
+  const traced = det.value?.tracedConeDeg;
+  analysis.cone_deg = Number.isFinite(x) && (traced === undefined || Math.abs(x - traced) > 1e-6) ? x : null;
+}
 const mapMax = computed(() => (det.value?.stats.max ?? 1) * 1.02 || 1);
 /** What the light path analysis needs to know about the map on screen. */
 const anaCtx = computed<AnalysisCtx | null>(() => {
@@ -211,7 +236,7 @@ const anaCtx = computed<AnalysisCtx | null>(() => {
     uMm: d.uExtentMm,
     vMm: d.vExtentMm,
     valid: d.valid,
-    values: d[d.quantity === "luminance" ? "luminance" : "exitance"],
+    values: d.map ?? d[d.quantity === "luminance" ? "luminance" : "exitance"],
     roi: analysis.roi,
     vmax: mapMax.value,
     unit: d.unit,
@@ -256,10 +281,11 @@ watch(() => props.runId, () => {
   stateId.value = undefined;
   result.value = null;
   analysis.roi = null;
+  analysis.cone_deg = null;
   compareWith.value = null;
   schedule();
 }, { immediate: true });
-watch([stateId, () => analysis.view, () => analysis.smooth, () => analysis.hotspot_ratio, () => analysis.roi], schedule);
+watch([stateId, () => analysis.view, () => analysis.smooth, () => analysis.hotspot_ratio, () => analysis.roi, () => analysis.cone_deg], schedule);
 watch(detIdx, () => result.value && emit("loaded", result.value, detIdx.value, mapMax.value));
 onBeforeUnmount(() => window.clearTimeout(timer));
 

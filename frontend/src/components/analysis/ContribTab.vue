@@ -19,7 +19,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-if="overview.directFraction > 0">
+          <tr v-if="overview.directFraction > 0" class="clickable" :class="{ sel: selected === DIRECT }" @click="select(DIRECT)">
             <td><i class="swatch" style="background: #f2c744" /> Straight from the LED</td>
             <td>{{ fmtPct(overview.directFraction, 1) }}</td>
             <td colspan="3" class="muted">no tagged surface on the way</td>
@@ -39,7 +39,16 @@
       </table>
       <p v-if="hidden > 0" class="muted small">{{ hidden }} more surfaces with little light are not listed.</p>
 
-      <div v-if="sel" class="ana-detail">
+      <div v-if="selected === DIRECT" class="ana-detail">
+        <div class="ana-detail-head">
+          <strong><i class="swatch" style="background: #f2c744" /> Straight from the LED</strong>
+          <span class="spacer" />
+          <button class="btn primary small" title="See the rays that reach the exit surface without meeting any of your surfaces." @click="view3d"><Box :size="14" /> View in 3D</button>
+        </div>
+        <p class="muted small ana-where">Light that reaches the exit surface without bouncing off or crossing any tagged surface.</p>
+        <FootprintMap :ctx="ctx" kind="group" :id="DIRECT" />
+      </div>
+      <div v-else-if="sel" class="ana-detail">
         <div class="ana-detail-head">
           <strong><i class="swatch" :style="{ background: sel.color }" /> {{ sel.name }}</strong>
           <span class="muted small">{{ sel.faces.length }} face{{ sel.faces.length === 1 ? "" : "s" }} · {{ sel.areaMm2.toFixed(1) }} mm²</span>
@@ -70,6 +79,8 @@ const overview = ref<AnalysisOverview | null>(null);
 const loading = ref(false);
 const error = ref("");
 const selected = ref<number | null>(null);
+/** The "straight from the LED" row: light that met none of the tagged surfaces (group -1 in the analysis). */
+const DIRECT = -1;
 
 const MIN_SHARE = 0.0005;
 const MAX_ROWS = 20;
@@ -91,7 +102,8 @@ async function loadOverview() {
     if (mine !== seq) return;
     overview.value = o;
     error.value = "";
-    if (selected.value !== null && !o.groups.some((g) => g.index === selected.value)) selected.value = null;
+    const keepDirect = selected.value === DIRECT && o.directFraction > 0;
+    if (selected.value !== null && !keepDirect && !o.groups.some((g) => g.index === selected.value)) selected.value = null;
     if (selected.value === null) selected.value = [...o.groups].sort((a, b) => b.lastFraction - a.lastFraction)[0]?.index ?? null;
   } catch (e) {
     if (mine === seq) {
@@ -110,6 +122,18 @@ const mode = ref<"last" | "touched">("last");
 
 /** See this surface in the 3D model: lit up, with where its light lands and (on request) its rays. */
 function view3d() {
+  if (selected.value === DIRECT) {
+    av.viewSelection({
+      id: `surface:direct:${props.ctx.detector}`,
+      kind: "surface",
+      label: "Straight from the LED",
+      spots: [],
+      footprint: { kind: "group", id: DIRECT, mode: "last", detector: props.ctx.detector, vmax: props.ctx.vmax },
+      rays: { filter: { lastGroup: DIRECT, outcome: "exit" }, label: "Straight from the LED, reached the exit", color: "led" },
+      showRays: true,
+    });
+    return;
+  }
   const g = sel.value;
   if (!g) return;
   const last = mode.value === "last";

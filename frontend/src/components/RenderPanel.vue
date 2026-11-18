@@ -12,10 +12,10 @@
           </select>
         </label>
         <label class="mini narrow"><span>Width</span>
-          <select v-model.number="form.width"><option v-for="w in [320, 640, 960, 1280]" :key="w" :value="w">{{ w }} px</option></select>
+          <select v-model.number="form.width"><option v-for="w in [320, 640, 960, 1280, 1920, 2560, 3840]" :key="w" :value="w">{{ w }} px</option></select>
         </label>
         <label class="mini narrow"><span>Samples</span>
-          <select v-model.number="form.spp"><option v-for="s in [8, 32, 128, 512, 2048]" :key="s" :value="s">{{ s }}</option></select>
+          <select v-model.number="form.spp"><option v-for="s in [8, 32, 128, 512, 2048, 8192, 16384, 32768]" :key="s" :value="s">{{ s }}</option></select>
         </label>
         <label class="mini narrow"><span>Turn {{ form.azimuth }}°</span><input v-model.number="form.azimuth" type="range" min="-70" max="70" step="5" /></label>
         <label class="mini narrow"><span>Tilt {{ form.elevation }}°</span><input v-model.number="form.elevation" type="range" min="-70" max="70" step="5" /></label>

@@ -286,7 +286,7 @@ def test_live_override_changes_the_result_without_touching_the_setup(client, pro
     parts = client.get(f"/api/revisions/{rid}/parts").json()["instances"]
     pipe = next(p for p in parts if "pipe" in p["name"].lower())
     out = {}
-    for tio2 in (0.02, 0.4):
+    for tio2 in (0.01, 0.6):
         res = client.post(
             f"/api/revisions/{rid}/live",
             json={"rays": 30_000, "overrides": [{"parameter": "tio2_wt_pct", "part": pipe["name"], "value": tio2}]},
@@ -295,7 +295,7 @@ def test_live_override_changes_the_result_without_touching_the_setup(client, pro
         runid = res.json()["id"]
         assert _wait(client, f"/api/runs/{runid}")["status"] == "ready"
         out[tio2] = client.get(f"/api/runs/{runid}/results").json()["detectors"][0]["efficiency"]
-    assert out[0.02] > 3 * out[0.4]  # heavy diffusion keeps the light from reaching the far end
+    assert out[0.01] > 3 * out[0.6]  # heavy diffusion keeps the light from reaching the far end
     assert client.get(f"/api/projects/{project['pid']}/setup").json() == before
     bad = client.post(f"/api/revisions/{rid}/live", json={"overrides": [{"parameter": "tio2_wt_pct", "part": pipe["name"], "value": 900}]})
     assert bad.status_code == 400
@@ -354,3 +354,163 @@ def test_live_view_frame(client, project):
     from lightsim import store
 
     assert not store.run_dir(rid, runid).exists()  # the helper let go of the folder
+
+def test_run_stops_at_noise_target_and_reports_noise(client, project):
+    res = client.post(f"/api/revisions/{project['a']}/runs", json={"settings": {"rays": 400_000, "target_noise": 0.5, "analysis": False}})
+    assert res.status_code == 200, res.text
+    runid = res.json()["id"]
+    meta = _wait(client, f"/api/runs/{runid}")
+    assert meta["status"] == "ready", meta.get("error")
+    assert meta["raysTraced"] < 400_000  # a 50 % target is reached after the first pass
+    assert meta["hasAnalysis"] is False
+    det = client.get(f"/api/runs/{runid}/results").json()["detectors"][0]
+    assert det["noise"] is not None and 0 < det["noise"]["median"] <= 0.5
+    assert len(det["map"]) == det["nv"]
+    bad = client.post(f"/api/revisions/{project['a']}/runs", json={"settings": {"target_noise": 0.001}})
+    assert bad.status_code == 400
+
+
+def test_results_at_another_viewing_cone(client, project):
+    import os
+
+    import numpy as np
+
+    from lightsim import store
+
+    runid = _run(client, project["a"], rays=60_000)
+    url = f"/api/runs/{runid}/results"
+    base = client.get(url).json()["detectors"][0]
+    lo, hi = base["coneRange"]
+    traced = base["tracedConeDeg"]
+    assert base["coneDeg"] == traced and lo < traced < hi
+    # the traced angle (asked for explicitly) is the default result
+    same = client.get(url, params={"cone_deg": traced}).json()["detectors"][0]
+    assert same["luminance"] == base["luminance"] and same["coneDeg"] == traced
+    # another angle: luminance (flux per solid angle and area) changes, exit flux does not; a wider cone than the rings reach is limited
+    wide = client.get(url, params={"cone_deg": hi}).json()["detectors"][0]
+    assert wide["coneDeg"] == hi and wide["luminance"] != base["luminance"] and wide["exitLm"] == base["exitLm"]
+    assert wide["noise"] is not None
+    assert client.get(url, params={"cone_deg": 90}).json()["detectors"][0]["coneDeg"] == hi
+    assert client.get(url, params={"cone_deg": 120}).status_code == 400
+    # a run made before the rings existed ignores the angle
+    path = store.run_dir(project["a"], runid) / "tallies.npz"
+    with np.load(path) as z:
+        old = {k: z[k] for k in z.files if k not in ("ring", "ring2")}
+    np.savez_compressed(path, **old)
+    os.utime(path, (time.time() + 5, time.time() + 5))  # the results are cached by modification time
+    legacy = client.get(url, params={"cone_deg": hi}).json()["detectors"][0]
+    assert legacy["coneRange"] is None and legacy["coneDeg"] == traced and legacy["luminance"] == base["luminance"]
+    client.delete(f"/api/runs/{runid}")
+
+
+def test_noise_target_run_keeps_analysis_with_a_final_pass(client, project):
+    import numpy as np
+
+    from lightsim import store
+    from lightsim.analysis import ANALYSIS_FILE
+
+    # stops after the first 250,000 rays; the analysis pass covers only the first 100,000, so its tables are scaled by 2.5
+    res = client.post(
+        f"/api/revisions/{project['a']}/runs",
+        json={"settings": {"rays": 400_000, "target_noise": 0.5, "analysis": True, "analysis_rays": 100_000}},
+    )
+    assert res.status_code == 200, res.text
+    runid = res.json()["id"]
+    meta = _wait(client, f"/api/runs/{runid}")
+    assert meta["status"] == "ready", meta.get("error")
+    assert meta["raysTraced"] == 250_000
+    assert meta["hasAnalysis"] is True
+    rdir = store.run_dir(project["a"], runid)
+    with np.load(rdir / "tallies.npz") as z:
+        cone_y = z["cone"][..., 1].sum(axis=1)  # luminous weight inside the viewing cone, per channel, summed over 250,000 rays
+    with np.load(rdir / ANALYSIS_FILE) as z:
+        tot_y = z["tot_map"][:, 1].sum(axis=1)  # the same from the 100,000 re-traced rays, scaled up
+        assert z["dep_rid"].max() < 100_000  # the ray logs are those of the first rays only
+    assert tot_y == pytest.approx(cone_y, rel=0.1)
+    # the analysis API answers for this run
+    assert client.get(f"/api/runs/{runid}/analysis").status_code == 200
+
+def test_one_channel_per_led_keeps_the_brightest_driven_channel():
+    from types import SimpleNamespace as NS
+
+    from lightsim.simrun import one_channel_per_led
+
+    def ch(led, cid, flux):
+        return NS(key=f"{led}/{cid}", led_id=led, flux_lm=flux)
+
+    used = [ch("a", "R", 10), ch("a", "G", 30), ch("a", "B", 5), ch("b", "R", 10), ch("b", "G", 30), ch("b", "B", 5)]
+    all_on = {"id": "all", "drive": {k.key: 1.0 for k in used}}
+    kept = one_channel_per_led(used, [all_on])
+    assert [s.key for s in kept] == ["a/G", "b/G"]  # the brightest of each LED, in the original order
+    # drive counts too: with the green channels dimmed to a tenth, red is the one that carries the light
+    dimmed = {"id": "dim", "drive": {**all_on["drive"], "a/G": 0.1, "b/G": 0.1}}
+    assert [s.key for s in one_channel_per_led(used, [dimmed])] == ["a/R", "b/R"]
+    # a channel that no state drives is not a candidate
+    off = {"id": "off", "drive": {**all_on["drive"], "a/G": 0.0}}
+    assert [s.key for s in one_channel_per_led(used, [off])] == ["a/R", "b/G"]
+
+
+def test_one_channel_per_led_run_completes(client, project):
+    res = client.post(f"/api/revisions/{project['a']}/runs", json={"settings": {"rays": 20_000, "one_channel_per_led": True}})
+    assert res.status_code == 200, res.text
+    runid = res.json()["id"]
+    meta = _wait(client, f"/api/runs/{runid}")
+    assert meta["status"] == "ready", meta.get("error")
+    assert meta["settings"]["one_channel_per_led"] is True
+    assert len(client.get(f"/api/runs/{runid}/scene").json()["channels"]) == 5  # the test LEDs have a single channel each
+
+
+def test_solvers_endpoint_and_validation(client, project):
+    doc = client.get("/api/solvers").json()
+    by_id = {s["id"]: s for s in doc["solvers"]}
+    assert by_id["cpu"]["available"] is True and "gpu" in by_id
+    res = client.post(f"/api/revisions/{project['a']}/runs", json={"settings": {"rays": 10_000, "solver": "quantum"}})
+    assert res.status_code == 400
+
+
+def test_gpu_run_matches_the_cpu_run_and_keeps_analysis(client, project):
+    from lightsim.engine import solvers
+
+    ok, why = solvers.gpu_status()
+    if not ok:
+        pytest.skip(f"no usable GPU solver: {why}")
+
+    def run(solver):
+        res = client.post(
+            f"/api/revisions/{project['a']}/runs",
+            json={"settings": {"rays": 200_000, "solver": solver, "analysis": True, "analysis_rays": 50_000, "seed": 4 if solver == "gpu" else 9}},
+        )
+        assert res.status_code == 200, res.text
+        runid = res.json()["id"]
+        meta = _wait(client, f"/api/runs/{runid}")
+        assert meta["status"] == "ready", meta.get("error")
+        return runid, meta
+
+    gid, gmeta = run("gpu")
+    cid, cmeta = run("cpu")
+    assert gmeta["solver"] == "gpu" and gmeta["solverName"] and cmeta["solver"] == "cpu"
+    assert gmeta["hasAnalysis"] is True  # a CPU pass over the first 50,000 rays, scaled
+    assert client.get(f"/api/runs/{gid}/analysis").status_code == 200
+    g = client.get(f"/api/runs/{gid}/results").json()
+    c = client.get(f"/api/runs/{cid}/results").json()
+    assert abs(g["lossSum"] - 1.0) < 1e-3
+    assert g["detectors"][0]["efficiency"] == pytest.approx(c["detectors"][0]["efficiency"], rel=0.03)
+    assert g["detectors"][0]["stats"]["mean"] == pytest.approx(c["detectors"][0]["stats"]["mean"], rel=0.05)
+
+def test_live_preview_on_the_gpu(client, project):
+    from lightsim.engine import solvers
+
+    ok, why = solvers.gpu_status()
+    if not ok:
+        pytest.skip(f"no usable GPU solver: {why}")
+    rid = project["a"]
+    res = client.post(f"/api/revisions/{rid}/live", json={"rays": 200_000, "solver": "gpu"})
+    assert res.status_code == 200, res.text
+    first = res.json()
+    assert first["settings"]["solver"] == "gpu"
+    done = _wait(client, f"/api/runs/{first['id']}")
+    assert done["status"] == "ready", done.get("error")
+    assert done["solver"] == "gpu" and done["raysTraced"] == 200_000
+    got = client.get(f"/api/runs/{first['id']}/results").json()
+    assert got["detectors"][0]["efficiency"] > 0 and abs(got["lossSum"] - 1.0) < 1e-3
+    client.delete(f"/api/runs/{first['id']}")

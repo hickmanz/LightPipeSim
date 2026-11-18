@@ -187,6 +187,11 @@ def test_overview_and_maps(client, run):
     assert m["fraction"] == pytest.approx(g["lastFraction"], abs=1e-3)
     t = client.get(f"/api/runs/{run}/analysis/group-map", params={"group": g["index"], "mode": "touched"}).json()
     assert t["fraction"] >= m["fraction"] - 1e-6
+    # the light that came straight from the LED (group -1) has a map too, but only "left it last" is meaningful for it
+    d = client.get(f"/api/runs/{run}/analysis/group-map", params={"group": -1, "mode": "last"})
+    assert d.status_code == 200
+    assert d.json()["fraction"] == pytest.approx(ov["directFraction"], abs=1e-3)
+    assert client.get(f"/api/runs/{run}/analysis/group-map", params={"group": -1, "mode": "touched"}).status_code == 404
 
 
 def test_groups_know_where_they_are(client, run):

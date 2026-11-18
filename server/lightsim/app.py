@@ -99,6 +99,14 @@ def health() -> dict:
     return {"ok": True, "app": "lightsim", "mode": desktop.mode, "version": __version__, "dataDir": str(store.data_dir())}
 
 
+@app.get("/api/solvers")
+def solvers_info() -> dict:
+    """The solvers a run can use and whether this machine can run them (the GPU one needs Warp and a CUDA device)."""
+    from .engine import solvers
+
+    return solvers.describe()
+
+
 # -- projects ----------------------------------------------------------------------------
 def _project_payload(project: dict, with_revisions: bool = False) -> dict:
     metas = [m for m in (store.load_rev(r) for r in project.get("revisions", [])) if m]
@@ -422,9 +430,10 @@ def delete_library_entry(kind: str, entry_id: str) -> dict:
 
 class MieBody(BaseModel):
     tio2_wt_pct: float = 1.0
-    diameter_um: float = 0.25
+    diameter_um: float = 0.3
     host: str = "pc"
-    sigma_g: float = 1.0
+    sigma_g: float = 1.3
+    efficiency: float = 1.0  # dispersion efficiency: scales mu_s, 1 = ideal dispersion of spheres
     thickness_mm: float = 3.0
 
 
@@ -436,7 +445,7 @@ def mie_calculator(body: MieBody) -> dict:
     from .materials import mie
 
     try:
-        cur = mie.scattering_curves(body.tio2_wt_pct, body.diameter_um, body.host, body.sigma_g)
+        cur = mie.scattering_curves(body.tio2_wt_pct, body.diameter_um, body.host, body.sigma_g, efficiency=body.efficiency)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, str(exc))
     lam = cur["lambda"]
@@ -646,6 +655,21 @@ def _run_settings(body_settings: dict | None) -> dict:
     settings = {**DEFAULT_SETTINGS, **(body_settings or {})}
     if not (1000 <= int(settings["rays"]) <= 50_000_000):
         raise HTTPException(400, "rays must be between 1,000 and 50,000,000 per channel")
+    tn = float(settings.get("target_noise") or 0.0)
+    if tn != 0.0 and not (0.005 <= tn <= 0.5):
+        raise HTTPException(400, "target_noise must be 0 (off) or between 0.005 and 0.5")
+    settings["target_noise"] = tn
+    settings["one_channel_per_led"] = bool(settings.get("one_channel_per_led"))
+    from .engine import solvers
+
+    solver = str(settings.get("solver") or "cpu")
+    if solver not in solvers.SOLVERS:
+        raise HTTPException(400, f"solver must be one of {', '.join(solvers.SOLVERS)}")
+    if solver == "gpu":
+        ok, why = solvers.gpu_status()
+        if not ok:
+            raise HTTPException(400, f"The GPU solver is not available: {why}")
+    settings["solver"] = solver
     return settings
 
 
@@ -709,6 +733,8 @@ class LiveBody(BaseModel):
     rays: int = 400_000  # per channel; traced in growing passes, the results can be read after each one
     overrides: list[dict] = []  # [{"parameter": "tio2_wt_pct", "part": "Light Pipe:1", "value": 0.05}] tried without changing the setup
     max_resolution: int = 200  # live maps are coarser than a full run's so that the first passes are quick
+    target_noise: float = 0.0  # > 0: stop before `rays` once the median relative noise per map pixel is below this
+    solver: str = "cpu"  # "cpu" or "gpu" (see /api/solvers)
 
 
 def _drop_run(rid: str, runid: str) -> None:
@@ -750,7 +776,7 @@ def start_live(rid: str, body: LiveBody) -> dict:
     for d in setup.get("detectors", []):
         d["resolution"] = min(int(d.get("resolution", 160)), max(40, int(body.max_resolution)))
     _preflight(rid, setup, library)
-    settings = _run_settings({"rays": body.rays, "live": True, "preview_paths": 4})
+    settings = _run_settings({"rays": body.rays, "live": True, "preview_paths": 4, "target_noise": body.target_noise, "solver": body.solver})
     for old in _live_runs(rid):
         _drop_run(rid, old["id"])
     return _run_payload(_launch_run(rid, meta, setup, library, settings, "Live preview"))
@@ -929,8 +955,8 @@ def create_render(runid: str, body: RenderBody) -> dict:
         raise HTTPException(501, why)
     if body.mode not in ("map", "transport"):
         raise HTTPException(400, "mode must be 'map' or 'transport'")
-    if not (160 <= body.width <= 2400) or not (1 <= body.spp <= 8192):
-        raise HTTPException(400, "width must be 160 to 2400 pixels and samples 1 to 8192")
+    if not (160 <= body.width <= 4096) or not (1 <= body.spp <= 32768):
+        raise HTTPException(400, "width must be 160 to 4096 pixels and samples 1 to 32768")
     key = ("render", run["revisionId"], runid)
     if jobs.is_active(key):
         raise HTTPException(409, "A picture of this run is already being rendered")
@@ -980,8 +1006,14 @@ def _run_data(runid: str):
     return data
 
 
-def _analysis_from_query(roi: str | None, margin: float | None, smooth: float | None, hotspot_ratio: float | None, hotspot_mm: float | None, view: str | None) -> dict:
+def _analysis_from_query(roi: str | None, margin: float | None, smooth: float | None, hotspot_ratio: float | None, hotspot_mm: float | None, view: str | None, map_smooth: float | None = None, cone_deg: float | None = None) -> dict:
     an: dict = {}
+    if cone_deg is not None:  # the viewing cone to show (limited per exit surface to the angles the run has rings for)
+        if not 0.0 < float(cone_deg) <= 90.0:
+            raise HTTPException(400, "cone_deg must be between 0 and 90")
+        an["cone_deg"] = float(cone_deg)
+    if map_smooth is not None:
+        an["map_smooth_px"] = max(0.0, min(float(map_smooth), 8.0))
     if roi:
         try:
             vals = [float(x) for x in roi.split(",")]
@@ -1014,12 +1046,14 @@ def run_results(
     hotspot_mm: float | None = None,
     view: str | None = None,
     led_maps: bool = True,
+    map_smooth: float | None = None,
+    cone_deg: float | None = None,
 ) -> dict:
     data = _run_data(runid)
     sid = state or data.state_ids()[0]
     if sid not in data.state_ids():
         raise HTTPException(404, "State not found")
-    an = _analysis_from_query(roi, margin, smooth, hotspot_ratio, hotspot_mm, view)
+    an = _analysis_from_query(roi, margin, smooth, hotspot_ratio, hotspot_mm, view, map_smooth, cone_deg)
     out = data.state_result(sid, an, with_led_maps=led_maps)
     out["states"] = [{"id": s["id"], "name": s["name"]} for s in data.scene["states"]]
     out["channels"] = data.scene["channels"]
@@ -1097,10 +1131,11 @@ def run_analysis(runid: str, state: str | None = None, view: str | None = None, 
 @app.get("/api/runs/{runid}/analysis/group-map")
 def run_analysis_group_map(runid: str, group: int | None = None, mode: str = "last", state: str | None = None, view: str | None = None, detector: int = 0) -> dict:
     ra = _run_analysis(runid)
-    if group is not None and not 0 <= group < ra.ng:
-        raise HTTPException(404, "Group not found")
     if mode not in ("last", "touched", "untouched", "all"):
         raise HTTPException(400, "mode must be last, touched, untouched or all")
+    # group -1 is the light that came straight from the LED (it met no tagged surface): only "last" makes sense for it
+    if group is not None and not (-1 <= group < ra.ng and (group >= 0 or mode == "last")):
+        raise HTTPException(404, "Group not found")
     return ra.group_map(_ana_state(ra, state), _ana_view(view), _ana_det(ra, detector), group, mode)
 
 
@@ -1237,7 +1272,10 @@ def run_analysis_rays(runid: str, body: RaysBody) -> dict:
         meta_ch = chans[ci]
         ids = [i for i, _ in items]
         wmap = {i: w for i, w in items}
-        out = replay(scene, srcs[meta_ch["key"]], meta_ch["seed"], ids, ra.meta["rrThreshold"], ra.meta["maxBounces"], int(np.clip(body.maxPoints, 16, 1024)))
+        try:
+            out = replay(scene, srcs[meta_ch["key"]], meta_ch["seed"], ids, ra.meta["rrThreshold"], ra.meta["maxBounces"], int(np.clip(body.maxPoints, 16, 1024)), ra.meta.get("solver", "cpu"))
+        except ValueError as exc:  # a GPU run on a machine without the GPU solver
+            raise HTTPException(400, str(exc))
         ch_info = ra.channels[ci]
         for r in out:
             gfs = np.asarray(r["gface"], dtype=int)
@@ -1319,11 +1357,12 @@ def compare_runs(
     roi: str | None = None,
     smooth: float | None = None,
     view: str | None = None,
+    cone_deg: float | None = None,
 ) -> dict:
     from . import results
 
     a, b = _run_data(runid), _run_data(other)
-    an = _analysis_from_query(roi, None, smooth, None, None, view)
+    an = _analysis_from_query(roi, None, smooth, None, None, view, None, cone_deg)
     ra = a.state_result(state or a.state_ids()[0], an, with_led_maps=False)
     rb = b.state_result(other_state or b.state_ids()[0], an, with_led_maps=False)
     if detector >= len(ra["detectors"]) or detector >= len(rb["detectors"]):
@@ -1360,6 +1399,7 @@ def compare_project_runs(
     roi: str | None = None,
     smooth: float | None = None,
     view: str | None = None,
+    cone_deg: float | None = None,
 ) -> dict:
     """Any number of finished runs of a project side by side (they may belong to different variants).
 
@@ -1374,7 +1414,7 @@ def compare_project_runs(
         raise HTTPException(400, "Each run can be compared once")
     variants = {v["id"]: v["name"] for v in project.get("variants", [])}
     first_variant = (project.get("variants") or [{}])[0].get("id")
-    an = _analysis_from_query(roi, None, smooth, None, None, view)
+    an = _analysis_from_query(roi, None, smooth, None, None, view, None, cone_deg)
     out, unit = [], None
     for runid in ids:
         run = _get_run(runid)
@@ -1424,13 +1464,14 @@ def run_image(
     roi: str | None = None,
     smooth: float | None = None,
     view: str | None = None,
+    cone_deg: float | None = None,
 ) -> Response:
     import numpy as np
 
     from . import results
 
     data = _run_data(runid)
-    an = _analysis_from_query(roi, None, smooth, None, None, view)
+    an = _analysis_from_query(roi, None, smooth, None, None, view, None, cone_deg)
     r = data.state_result(state or data.state_ids()[0], an, with_led_maps=False)
     if detector >= len(r["detectors"]):
         raise HTTPException(400, "Detector index out of range")
@@ -1606,8 +1647,10 @@ if FRONTEND_DIST.exists():
             raise HTTPException(404)
         candidate = (FRONTEND_DIST / full_path).resolve()
         if full_path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
-            return FileResponse(candidate)
-        return FileResponse(FRONTEND_DIST / "index.html")
+            # index.html names the hashed bundle of the current build: a browser (or the app window's WebView2) that
+            # kept an old copy would keep showing the old UI after an update, so it always asks again
+            return FileResponse(candidate, headers={"Cache-Control": "no-cache"} if candidate.suffix == ".html" else None)
+        return FileResponse(FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-cache"})
 else:
 
     @app.get("/", include_in_schema=False)

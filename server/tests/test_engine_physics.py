@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from lightsim import library as lib
-from lightsim.engine import sources, spectral, tracer
+from lightsim.engine import kernels, sources, spectral, tracer
 from lightsim.engine.scene import build_scene
 
 
@@ -269,3 +269,18 @@ def test_ballistic_fraction_of_scattering_slab():
     # the first angular bin (0 .. 90/nth deg) holds the ballistic light plus a little scattered light
     assert np.exp(-1.0) - 0.005 < first_bin < np.exp(-1.0) + 0.06
     assert nth >= 2
+
+
+def test_many_volume_scatters_do_not_hit_the_surface_bounce_limit():
+    """A thick turbid slab needs far more than max_bounces scattering events per ray: they have their own cap."""
+    b = Builder()
+    b.add_box("plate", (-300, -300, 10), (300, 300, 15))
+    setup = {
+        "parts": [{"match": "*", "finish": "black"}, {"match": "plate", "material": "turbid", "finish": "polished"}],
+        "leds": [led((0, 0, 0))],
+        "detectors": [detector("plate", 5, res=8)],
+    }
+    mat = {"n": 1.0, "absorption": 0.0, "scattering": {"type": "constant", "mus": 8.0, "g": 0.0}}  # optical depth 40
+    _, _, t = run(b, setup, library_with(turbid=mat), n=4_000)
+    assert t.special[kernels.MAXB] / t.n_rays < 0.001
+    assert 0.01 < t.det_pow[0] / t.n_rays < 0.15  # diffusion: about 1 / (1 + 0.75 * 40) of the light gets through, the rest leaves backwards

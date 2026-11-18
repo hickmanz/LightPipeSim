@@ -120,7 +120,7 @@ function pickGroup(i: number) {
   const g = report.value?.byGroup[i];
   if (!g) return;
   const key = `g:${g.group}`;
-  sub.value = sub.value?.key === key ? null : { key, label: g.group < 0 ? "straight from the LED" : `left “${g.name}” last`, extra: g.group >= 0 ? { lastGroup: g.group } : {} };
+  sub.value = sub.value?.key === key ? null : { key, label: g.group < 0 ? "straight from the LED" : `left “${g.name}” last`, extra: { lastGroup: g.group } };
 }
 function pickFamily(f: AnalysisFamily) {
   const key = `f:${f.id}`;

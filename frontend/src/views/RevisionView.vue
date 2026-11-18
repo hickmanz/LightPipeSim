@@ -152,6 +152,7 @@
           :white-balance="view.whiteBalance"
           :mode="view.mode"
           :resolution="view.resolution"
+          :state="live.shownState.value"
           @status="(s) => (view.status = s)"
         />
         <LivePanel v-if="livePanelOpen && ws.ready.value && !resultsCover" :live="live" :view="view" @close="livePanelOpen = false" />
@@ -495,7 +496,7 @@ const dockCtx = computed<AnalysisCtx | null>(() => {
     uMm: d.uExtentMm,
     vMm: d.vExtentMm,
     valid: d.valid,
-    values: d[d.quantity === "luminance" ? "luminance" : "exitance"],
+    values: d.map ?? d[d.quantity === "luminance" ? "luminance" : "exitance"],
     roi: null,
     vmax: c.vmax,
     unit: d.unit,
@@ -960,7 +961,7 @@ function refreshOverlay() {
       if (part && part.detector === di) drawMap(canvas, part.values, null, 0, part.vmax, { flipV: false });
       else {
         const vmax = (d.stats.max ?? 1) * 1.02 || 1;
-        drawMap(canvas, d[d.quantity === "luminance" ? "luminance" : "exitance"], d.valid, 0, vmax, { flipV: false });
+        drawMap(canvas, d.map ?? d[d.quantity === "luminance" ? "luminance" : "exitance"], d.valid, 0, vmax, { flipV: false });
       }
       maps.push({ corners: s.corners, normal: s.n, canvas, mesh: s.mesh });
     });

@@ -3,15 +3,19 @@
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { api, type DetectorResult, type LiveOverride, type RunMeta, type RunScene, type StateResult } from "../api";
 import { partPattern, resolvePart } from "../utils/setup";
+import { useSolvers } from "./useSolvers";
 import type { Workspace } from "./useWorkspace";
 
-export const LIVE_RAY_CHOICES = [100_000, 400_000, 1_000_000];
+export const LIVE_RAY_CHOICES = [100_000, 400_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000];
 /** The TiO2 slider works on a logarithmic scale between these loadings (wt %). */
-export const TIO2_RANGE = [0.01, 5] as const;
+export const TIO2_RANGE = [0.0005, 5] as const;
 
 export function useLivePreview(ws: Workspace) {
+  const { solver, gpu, chosen } = useSolvers();
   const enabled = ref(false);
   const rays = ref(400_000);
+  /** 0 = trace all `rays`; otherwise stop earlier once the median noise per map pixel is below this fraction. */
+  const targetNoise = ref(0);
   const run = shallowRef<RunMeta | null>(null);
   /** The run the photoreal view draws from; survives "keep" so the picture does not vanish. */
   const viewRunId = ref<string | null>(null);
@@ -20,6 +24,16 @@ export function useLivePreview(ws: Workspace) {
   const starting = ref(false);
   const error = ref("");
   const notice = ref("");
+
+  // ── which state (set of LEDs that are on) is shown ──────────────────────────────
+  // The simulation traces every LED channel, so switching state needs no new run: the results and the photoreal view
+  // just combine the channels differently. A setup without states has the one state "all" (as on the server).
+  const states = computed(() => {
+    const list = (ws.setup.value?.states ?? []).filter((s) => s.id);
+    return list.length ? list.map((s) => ({ id: s.id, name: s.name || s.id })) : [{ id: "all", name: "All LEDs on" }];
+  });
+  const stateId = ref("");
+  const shownState = computed(() => (states.value.some((s) => s.id === stateId.value) ? stateId.value : states.value[0].id));
 
   // ── what the slider changes ──────────────────────────────────────────────────
   const partId = ref("");
@@ -77,7 +91,7 @@ export function useLivePreview(ws: Workspace) {
         error.value = "";
         try {
           const setup = JSON.parse(JSON.stringify(ws.setup.value));
-          const r = await api.startLive(ws.rid.value, { setup, rays: rays.value, overrides: overrides() });
+          const r = await api.startLive(ws.rid.value, { setup, rays: rays.value, overrides: overrides(), target_noise: targetNoise.value, solver: solver.value });
           if (!enabled.value) {
             void api.cancelRun(r.id).catch(() => undefined);
             break;
@@ -123,7 +137,10 @@ export function useLivePreview(ws: Workspace) {
       finished = r.status === "ready";
       if ((done > 0 && done !== lastRays) || finished) {
         if (sceneRun !== r.id) await loadScene(r.id);
-        result.value = await api.results(r.id, undefined, undefined, false);
+        const sid = shownState.value;
+        const res = await api.results(r.id, sid, undefined, false);
+        if (gen !== generation) return;
+        if (sid === shownState.value) result.value = res; // else the state was changed meanwhile and its own load follows
         next = done;
         if (finished) return; // the last pass is in
       }
@@ -132,6 +149,22 @@ export function useLivePreview(ws: Workspace) {
     }
     if (gen === generation) schedulePoll(450, gen, next);
   }
+  /** Another state was picked: read the results of the run so far again for it (the run itself carries on). */
+  async function reloadResult() {
+    const r = run.value;
+    if (!enabled.value || !r || !(r.live?.rays || r.status === "ready")) return;
+    const sid = shownState.value;
+    const gen = generation;
+    try {
+      const res = await api.results(r.id, sid, undefined, false);
+      if (gen === generation && sid === shownState.value) result.value = res;
+    } catch {
+      // no light in this state (yet): do not keep showing the numbers of the previous state
+      if (gen === generation && sid === shownState.value) result.value = null;
+    }
+  }
+  watch(shownState, () => void reloadResult());
+
   let sceneRun = "";
   async function loadScene(rid: string) {
     try {
@@ -152,6 +185,8 @@ export function useLivePreview(ws: Workspace) {
   watch(() => ws.setup.value, () => restartSoon(), { deep: true });
   watch(() => ws.library.value, () => restartSoon(), { deep: true });
   watch(rays, () => restartSoon(100));
+  watch(targetNoise, () => restartSoon(100));
+  watch(solver, () => restartSoon(100));
 
   function setTio2(v: number | null) {
     tio2.value = v;
@@ -233,8 +268,8 @@ export function useLivePreview(ws: Workspace) {
   });
 
   return {
-    enabled, rays, run, viewRunId, result, scene, starting, error, notice,
-    diffusers, partId, tio2, baseTio2, shownTio2, phase, progress, detector,
+    enabled, rays, targetNoise, gpu, chosen, run, viewRunId, result, scene, starting, error, notice,
+    states, stateId, shownState, diffusers, partId, tio2, baseTio2, shownTio2, phase, progress, detector,
     toggle, keep, setTio2, selectPart, restartSoon,
   };
 }

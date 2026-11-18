@@ -12,10 +12,22 @@ import numpy as np
 
 from .. import library as lib
 from ..optical_mesh import triangle_normals_areas
-from . import faceref, spectral, tags
+from . import faceref, pixel_area, spectral, tags
 from .kernels import SD
 
-MAX_DETECTOR_PIXELS = 300_000
+MAX_DETECTOR_PIXELS = 300_000  # (the angle rings add 12 values per pixel to every thread's maps, see kernels.NRING)
+RING_STEP_DEG = 5.0  # width of one angle ring around the viewing cone of an exit surface
+
+
+def ring_edges_deg(cone_deg: float) -> np.ndarray:
+    """The 7 edge angles (deg) of the 6 rings around a viewing cone: ``cone_deg`` is edge 3, three rings lie inside it and three outside.
+
+    The rings are ``RING_STEP_DEG`` wide (narrower for a small cone, so that the inner edge stays above 0) and clipped to 0..90.
+    Ring r holds the light that leaves between edge r and edge r + 1; the cone itself is tallied separately (all light up to edge 3).
+    """
+    t0 = float(np.clip(cone_deg, 0.0, 90.0))
+    step = min(RING_STEP_DEG, max(t0, 1.0) / 3.0)
+    return np.clip(t0 + (np.arange(7) - 3) * step, 0.0, 90.0)
 
 DEFAULT_FINISH = "black"
 
@@ -77,6 +89,11 @@ class Detector:
     tri_uv: np.ndarray | None = None  # (n tris, 3, 2) mm, in the order of tri_ids, when unwrapped
     mesh: dict | None = None  # overlay mesh (positions, normals, uv in 0..1) when unwrapped
 
+    @property
+    def ring_deg(self) -> np.ndarray:
+        """Edge angles (deg) of the angle rings around this exit surface's viewing cone."""
+        return ring_edges_deg(self.cone_deg)
+
 
 @dataclass
 class Scene:
@@ -126,6 +143,7 @@ class Scene:
     gface_face: np.ndarray | None = None
     tface_gface: np.ndarray | None = None
     coarse: dict | None = None  # how exit-map pixels fold into the coarse analysis maps
+    det_ring: np.ndarray | None = None  # (ndet, 7) cos of the edges of the angle rings around every viewing cone
 
     # -- Embree ------------------------------------------------------------------------------
     def build_embree(self) -> None:
@@ -235,26 +253,15 @@ def _fit_detector(
         nu, nv = int(np.clip(np.ceil(lu / pix), 4, 1600)), int(np.clip(np.ceil(lv / pix), 4, 1600))
         warnings.append(f"Detector {det_doc.get('name', index)}: the map was limited to {nu} x {nv} pixels (at most {MAX_DETECTOR_PIXELS:,} per exit surface).")
 
-    # surface area per pixel by area-weighted sampling of the detector triangles
-    rng = np.random.default_rng(1234)
-    ns = 300_000
-    cdf = np.cumsum(area) / max(total, 1e-18)
-    pick = np.minimum(np.searchsorted(cdf, rng.random(ns)), len(area) - 1)
-    a, b = rng.random(ns), rng.random(ns)
-    flip = a + b > 1.0
-    a[flip], b[flip] = 1 - a[flip], 1 - b[flip]
-    tv = V[tris[pick]]
-    pts_s = tv[:, 0] + a[:, None] * (tv[:, 1] - tv[:, 0]) + b[:, None] * (tv[:, 2] - tv[:, 0])
+    # surface area per pixel: every detector triangle clipped against the pixel grid (exact, so no noise of its own)
     if mode == 1:
-        uvs = tri_uv[pick]
-        uv_s = uvs[:, 0] + a[:, None] * (uvs[:, 1] - uvs[:, 0]) + b[:, None] * (uvs[:, 2] - uvs[:, 0])
-        su = np.clip((uv_s[:, 0] - ext[0]) / lu, 0, 1 - 1e-12)
-        sv = np.clip((uv_s[:, 1] - ext[2]) / lv, 0, 1 - 1e-12)
+        xy = tri_uv.copy()
     else:
-        su = np.clip(((pts_s - cen) @ u - ext[0]) / lu, 0, 1 - 1e-12)
-        sv = np.clip(((pts_s - cen) @ v - ext[2]) / lv, 0, 1 - 1e-12)
-    amap = np.zeros((nv, nu))
-    np.add.at(amap, ((sv * nv).astype(int), (su * nu).astype(int)), total / ns)
+        tv = V[tris]
+        xy = np.stack([(tv - cen) @ u, (tv - cen) @ v], axis=-1)
+    xy[..., 0] = (xy[..., 0] - ext[0]) / lu * nu
+    xy[..., 1] = (xy[..., 1] - ext[2]) / lv * nv
+    amap = pixel_area.exact_pixel_areas(xy, area, nu, nv)
     mesh = None
     if mode == 1:
         nrm_t = tri_nrm[tri_ids]
@@ -430,6 +437,7 @@ def build_scene(opt: dict[str, np.ndarray], opt_doc: dict, setup: dict, library:
     det_nuv = np.ones((nd, 2), dtype=np.int32)
     det_off = np.zeros(nd, dtype=np.int64)
     det_cos = np.ones(nd)
+    det_ring = np.ones((nd, 7))  # cos of the 7 ring edges of every exit surface (falling), see ring_edges_deg
     det_mode = np.zeros(nd, dtype=np.int32)
     tri_uv_all = np.zeros((len(T) if any(d.mode for d in detectors) else 1, 3, 2))
     for k, d in enumerate(detectors):
@@ -441,6 +449,8 @@ def build_scene(opt: dict[str, np.ndarray], opt_doc: dict, setup: dict, library:
         det_nuv[k] = (d.nu, d.nv)
         det_off[k] = d.offset
         det_cos[k] = np.cos(np.radians(d.cone_deg))
+        det_ring[k] = np.cos(np.radians(d.ring_deg))
+        det_ring[k, 3] = det_cos[k]  # the cone edge is the very threshold of the cone tally
 
     # -- tables ---------------------------------------------------------------------------------------
     mat_n = np.stack([r.n for r in resolved])
@@ -472,6 +482,7 @@ def build_scene(opt: dict[str, np.ndarray], opt_doc: dict, setup: dict, library:
         resolved=face_refs,
         tri_gface=tg["tri_gface"], tri_group=tg["tri_group"], tri_tface=tg["tri_tface"], groups=tg["groups"],
         gface_body=tg["gface_body"], gface_face=tg["gface_face"], tface_gface=tg["tface_gface"], coarse=coarse,
+        det_ring=det_ring,
     )
     if build_rays:
         scene.build_embree()

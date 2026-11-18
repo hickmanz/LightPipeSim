@@ -31,7 +31,7 @@
       <p class="muted small">Values: {{ values.map((v) => fmt(v)).join(", ") }}. {{ values.length }} runs of {{ rays.toLocaleString() }} rays per channel.</p>
       <label class="mini">
         <span>Rays per channel</span>
-        <select v-model.number="rays"><option v-for="r in [50000, 100000, 200000, 500000, 1000000]" :key="r" :value="r">{{ r.toLocaleString() }}</option></select>
+        <select v-model.number="rays"><option v-for="r in [50000, 100000, 200000, 500000, 1000000, 2000000, 5000000]" :key="r" :value="r">{{ r.toLocaleString() }}</option></select>
       </label>
       <button class="btn primary" :disabled="busy || values.length < 2 || !ws.check.value" @click="start"><Play :size="15" /> Run sweep</button>
       <p v-if="error" class="error small">{{ error }}</p>
@@ -82,13 +82,13 @@ defineEmits<{ open: [id: string] }>();
 const ws = useWorkspace();
 
 const PARAMS = [
-  { id: "tio2_wt_pct", label: "TiO₂ loading", unit: "wt %", from: 0.02, to: 0.5, spacing: "log" },
+  { id: "tio2_wt_pct", label: "TiO₂ loading", unit: "wt %", from: 0.002, to: 0.2, spacing: "log" },
   { id: "diameter_um", label: "TiO₂ particle diameter", unit: "µm", from: 0.15, to: 0.6, spacing: "lin" },
   { id: "mus", label: "Scattering coefficient", unit: "1/mm", from: 0.1, to: 5, spacing: "log" },
 ];
 const parameter = ref("tio2_wt_pct");
-const from = ref(0.02);
-const to = ref(0.5);
+const from = ref(0.002);
+const to = ref(0.2);
 const steps = ref(6);
 const spacing = ref<"log" | "lin">("log");
 const rays = ref(100000);

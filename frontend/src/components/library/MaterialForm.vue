@@ -32,12 +32,17 @@
     </template>
 
     <template v-if="scType === 'mie'">
-      <label class="field"><span>TiO₂ loading (weight %)</span><input v-model.number="sc.tio2_wt_pct" type="number" step="0.1" min="0" max="60" :disabled="readonly" /></label>
+      <label class="field"><span>TiO₂ loading (weight %)</span><input v-model.number="sc.tio2_wt_pct" type="number" step="any" min="0" max="60" :disabled="readonly" /></label>
       <label class="field"><span>Particle diameter (µm)</span><input v-model.number="sc.diameter_um" type="number" step="0.01" min="0.05" max="5" :disabled="readonly" /></label>
       <label class="field">
         <span>Size spread (geometric σ)</span>
         <input v-model.number="sc.sigma_g" type="number" step="0.05" min="1" max="2" :disabled="readonly" />
         <small class="muted">1.0 means all particles are the same size; real powders are about 1.3 to 1.5.</small>
+      </label>
+      <label class="field">
+        <span>Dispersion efficiency (1 = ideal)</span>
+        <input v-model.number="sc.efficiency" type="number" step="0.05" min="0" max="10" placeholder="1" :disabled="readonly" />
+        <small class="muted">Scales the scattering coefficient. 1 is a perfectly dispersed filler of spheres; agglomerated or poorly dispersed TiO₂ scatters less (try 0.3 to 0.7), so set it from one measured part.</small>
       </label>
       <label class="field">
         <span>Host polymer</span>
@@ -131,7 +136,7 @@ const scType = computed(() => String(sc.value.type ?? "none"));
 function setScType(t: string) {
   if (t === "none") props.doc.scattering = { type: "none" };
   else if (t === "constant") props.doc.scattering = { type: "constant", mus: 0.5, g: 0.6 };
-  else if (t === "mie") props.doc.scattering = { type: "mie", tio2_wt_pct: 1, diameter_um: 0.25, sigma_g: 1.3, host: "pc" };
+  else if (t === "mie") props.doc.scattering = { type: "mie", tio2_wt_pct: 1, diameter_um: 0.3, sigma_g: 1.3, host: "pc", efficiency: 1 };
   else if (t === "table") props.doc.scattering = { type: "table", lambda: [380, 780], mus: [0.5, 0.5], g: [0.6, 0.6] };
 }
 
@@ -160,7 +165,7 @@ async function runMie() {
   error.value = "";
   try {
     const s = sc.value;
-    mie.value = await api.mie({ tio2_wt_pct: s.tio2_wt_pct, diameter_um: s.diameter_um, host: s.host ?? "pc", sigma_g: s.sigma_g ?? 1, thickness_mm: thickness.value });
+    mie.value = await api.mie({ tio2_wt_pct: s.tio2_wt_pct, diameter_um: s.diameter_um, host: s.host ?? "pc", sigma_g: s.sigma_g ?? 1.3, efficiency: s.efficiency === "" || s.efficiency == null ? 1 : s.efficiency, thickness_mm: thickness.value });
   } catch (e) {
     error.value = (e as Error).message;
   } finally {

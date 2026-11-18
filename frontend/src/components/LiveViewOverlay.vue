@@ -26,6 +26,8 @@ const props = defineProps<{
   mode: "map" | "transport";
   /** Long side of the picture in pixels; 0 follows the size of the 3D view. */
   resolution: number;
+  /** The state (which LEDs are on) to draw; empty for the first one. */
+  state: string;
 }>();
 const emit = defineEmits<{
   status: [s: { state: "starting" | "waiting" | "live" | "error"; message: string; spp: number; ms: number; variant: string; fps: number }];
@@ -113,7 +115,7 @@ async function loop(my: number) {
       continue;
     }
     const resultKey = props.resultKey;
-    const vk = `${props.exposure}|${props.ambient}|${props.whiteBalance}|${props.mode}|${props.resolution}`;
+    const vk = `${props.exposure}|${props.ambient}|${props.whiteBalance}|${props.mode}|${props.resolution}|${props.state}`;
     if (vk !== lastView) {
       lastView = vk;
       lastSpp = 0;
@@ -155,6 +157,7 @@ async function loop(my: number) {
           ambient: props.ambient,
           white_balance: props.whiteBalance,
           mode: props.mode,
+          state: props.state || null,
         },
         abort.signal,
       );

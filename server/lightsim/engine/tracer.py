@@ -20,6 +20,8 @@ class Tally:
     n_rays: int
     ex: np.ndarray  # (total_pix, 3) XYZ weighted exitance, all directions
     cone: np.ndarray  # (total_pix, 3) XYZ weighted, only inside the viewing cone
+    ex2: np.ndarray  # (total_pix,) sum of the squared luminous deposits (all directions): the variance of ex[:, 1]
+    cone2: np.ndarray  # (total_pix,) the same for the viewing cone
     dirh: np.ndarray  # (ndet, nth, 3) XYZ weighted per polar angle bin
     det_pow: np.ndarray  # (ndet,) radiometric weight that reached each detector
     abs_vol: np.ndarray  # (nbody,)
@@ -30,6 +32,8 @@ class Tally:
     path_aux: np.ndarray | None = None  # (nrec, maxpts, 3): CAD face number, event, weight after the event
     steps: int = 0
     analysis: "Analysis | None" = None
+    ring: np.ndarray | None = None  # (total_pix, NRING) luminous weight Y in the angle rings around the viewing cone (scene.ring_edges_deg)
+    ring2: np.ndarray | None = None  # (total_pix, NRING) squares of the luminous deposits in the rings: their variance
 
     def total_accounted(self) -> float:
         s = self.special
@@ -54,11 +58,15 @@ class Analysis:
     end: dict = field(default_factory=dict)  # one row per ray: rid, out, nb, tag
 
 
+MAX_SCATTERS = 20000  # volume-scattering events per ray; strongly scattering parts need far more of them than surface hits
+
+
 def default_params(scene: Scene, rr_threshold: float = 0.01, max_bounces: int = 500, nrec: int = 0, maxpts: int = 0, analysis: bool = False) -> np.ndarray:
     p = np.zeros(kernels.NPARAMS)
     p[kernels.P_EPS] = scene.eps
     p[kernels.P_RR] = rr_threshold
     p[kernels.P_MAXB] = max_bounces
+    p[kernels.P_MAXSC] = MAX_SCATTERS
     p[kernels.P_ESCLEN] = max(scene.diag * 0.05, 1.0)
     p[kernels.P_NREC] = nrec
     p[kernels.P_MAXPTS] = maxpts
@@ -104,11 +112,15 @@ def trace_channel(
         n_rays=n_rays,
         ex=np.zeros((scene.total_pix, 3)),
         cone=np.zeros((scene.total_pix, 3)),
+        ex2=np.zeros(scene.total_pix),
+        cone2=np.zeros(scene.total_pix),
         dirh=np.zeros((ndet, nth, 3)),
         det_pow=np.zeros(ndet),
         abs_vol=np.zeros(nbody),
         abs_surf=np.zeros(nbody),
         special=np.zeros(kernels.NSPECIAL),
+        ring=np.zeros((scene.total_pix, kernels.NRING)),
+        ring2=np.zeros((scene.total_pix, kernels.NRING)),
     )
     if nrec:
         tally.paths = np.zeros((nrec, max_path_points, 3))
@@ -120,6 +132,11 @@ def trace_channel(
     path_aux = tally.path_aux if nrec else np.zeros((1, 1, 3))
     cmf = np.ascontiguousarray(spectral.CMF)
     threads = max(get_num_threads(), 1)
+    # the angle rings are tallied per thread chunk like the maps, but over the whole call (a batch uses the first ``nchunks`` chunks):
+    # 12 values per pixel and thread would be a lot to allocate again for every batch
+    ring_buf = np.zeros((threads, scene.total_pix, kernels.NRING))
+    ring2_buf = np.zeros((threads, scene.total_pix, kernels.NRING))
+    det_ring = scene.det_ring if scene.det_ring is not None else np.ones((ndet, 7))
 
     nface = len(scene.gface_body)
     ntface = len(scene.tface_gface)
@@ -149,6 +166,7 @@ def trace_channel(
         wt = np.ones(nb)
         rid = np.arange(done, done + nb, dtype=np.int32)
         nbn = np.zeros(nb, dtype=np.int32)
+        nsc = np.zeros(nb, dtype=np.int32)
         stack = np.zeros((nb, kernels.SD), dtype=np.int32)
         depth = np.zeros(nb, dtype=np.int32)
         if src.start_body is not None:
@@ -173,6 +191,8 @@ def trace_channel(
         cone_buf = np.zeros((nchunks, scene.total_pix, 3))
         dir_buf = np.zeros((nchunks, ndet, nth, 3))
         det_pow = np.zeros((nchunks, ndet))
+        ex2_buf = np.zeros((nchunks, scene.total_pix))
+        cone2_buf = np.zeros((nchunks, scene.total_pix))
         if analysis:
             face_t = np.zeros((nchunks, nface, 4))
             face_from = np.zeros((nchunks, ntface, kernels.NSLOT))
@@ -198,13 +218,13 @@ def trace_channel(
                 dep_pix = np.full(1, -1, dtype=np.int32)
                 dep_w = np.zeros((1, 3))
             kernels.step_kernel(
-                o, d, wt, lam, rid, nbn, stack, depth, rng, alive,
+                o, d, wt, lam, rid, nbn, nsc, stack, depth, rng, alive,
                 prim, tfar,
                 scene.V, scene.N, scene.T, scene.tri_n, scene.tri_body, scene.tri_fin, scene.tri_det,
                 scene.body_mat, scene.mat_n, scene.mat_ka, scene.mat_mus, scene.mat_g, scene.fin_type, scene.fin_p, scene.fin_spec,
                 scene.det_o, scene.det_u, scene.det_v, scene.det_n, scene.det_ext, scene.det_nuv, scene.det_off, scene.det_cos, scene.det_mode, scene.tri_uv,
                 cmf, params, nch,
-                abs_vol, abs_surf, special, ex_buf, cone_buf, dir_buf, det_pow,
+                abs_vol, abs_surf, special, ex_buf, cone_buf, dir_buf, det_pow, ex2_buf, cone2_buf, ring_buf, ring2_buf, det_ring,
                 path_buf, path_n, path_aux,
                 rtag, lastg, lastf, outc, dep_pix, dep_w,
                 scene.tri_group, scene.tri_gface, scene.tri_tface,
@@ -215,8 +235,8 @@ def trace_channel(
             if analysis:
                 _collect_step(ana, cmap, ng, ncoarse, log_end, rid, nbn, rtag, lastg, outc, dep_pix, dep_w, keep, dep_parts, end_parts)
             if not keep.all():
-                o, d, wt, lam, rid, nbn, stack, depth, rng = (
-                    o[keep], d[keep], wt[keep], lam[keep], rid[keep], nbn[keep], stack[keep], depth[keep], rng[keep],
+                o, d, wt, lam, rid, nbn, nsc, stack, depth, rng = (
+                    o[keep], d[keep], wt[keep], lam[keep], rid[keep], nbn[keep], nsc[keep], stack[keep], depth[keep], rng[keep],
                 )
                 if analysis:
                     rtag, lastg, lastf, outc = rtag[keep], lastg[keep], lastf[keep], outc[keep]
@@ -226,6 +246,8 @@ def trace_channel(
         tally.special += special.sum(axis=0)
         tally.ex += ex_buf.sum(axis=0)
         tally.cone += cone_buf.sum(axis=0)
+        tally.ex2 += ex2_buf.sum(axis=0)
+        tally.cone2 += cone2_buf.sum(axis=0)
         tally.dirh += dir_buf.sum(axis=0)
         tally.det_pow += det_pow.sum(axis=0)
         if analysis:
@@ -237,6 +259,8 @@ def trace_channel(
         done += nb
         if progress:
             progress((done - start) / n_rays)
+    tally.ring += ring_buf.sum(axis=0)
+    tally.ring2 += ring2_buf.sum(axis=0)
     if analysis:
         ana.dep = _concat(dep_parts)
         ana.end = _concat(end_parts)

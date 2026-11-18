@@ -25,10 +25,15 @@ SD = 6  # medium stack depth
 ESC, LEAK, ROUL, MAXB, ANOM, BACK = 0, 1, 2, 3, 4, 5
 NSPECIAL = 8
 
+# angle rings around the viewing cone of an exit surface (see scene.ring_edges_deg): the luminous weight (and its squares) that
+# leaves between two edge angles, per pixel, so the Results panel can show another cone angle without tracing again
+NRING = 6
+
 # params slots
 P_EPS, P_RR, P_MAXB, P_ESCLEN, P_NREC, P_MAXPTS, P_NTH = 0, 1, 2, 3, 4, 5, 6
 P_ANA = 7  # 1 = per-ray analysis tags, face tallies and deposit records
-NPARAMS = 8
+P_MAXSC = 8  # cap on volume-scattering events of one ray (surface hits are limited by P_MAXB on their own)
+NPARAMS = 9
 
 # -- analysis (see engine/tags.py) -------------------------------------------------------------------------
 # A tagged group g (0..62) is column g + 1 of the from/to tables; column 0 is "the LED" (from) or "the exit" (to).
@@ -178,7 +183,7 @@ def _aux(path_aux, r_id, k, gf, ev, w):
 @njit(cache=True, parallel=True)
 def step_kernel(
     # ray state (modified in place)
-    o, d, wt, lam, rid, nbn, stack, depth, rng, alive,
+    o, d, wt, lam, rid, nbn, nsc, stack, depth, rng, alive,
     # intersection results
     prim, tfar,
     # geometry
@@ -189,7 +194,7 @@ def step_kernel(
     det_o, det_u, det_v, det_n, det_ext, det_nuv, det_off, det_cos, det_mode, tri_uv,
     cmf, params, nchunks,
     # tallies (first axis = chunk)
-    abs_vol, abs_surf, special, ex_buf, cone_buf, dir_buf, det_pow,
+    abs_vol, abs_surf, special, ex_buf, cone_buf, dir_buf, det_pow, ex2_buf, cone2_buf, ring_buf, ring2_buf, det_ring,
     # path recording
     path_buf, path_n, path_aux,
     # analysis: per-ray tags, outcomes, exit deposits of this step, face tables and tallies
@@ -202,6 +207,7 @@ def step_kernel(
     eps = params[P_EPS]
     rr_thr = params[P_RR]
     max_b = params[P_MAXB]
+    max_sc = params[P_MAXSC]
     esc_len = params[P_ESCLEN]
     nrec = int(params[P_NREC])
     maxpts = int(params[P_MAXPTS])
@@ -276,7 +282,8 @@ def step_kernel(
                     oz += dz * sdist
                     g = mat_g[mat, li] * (1.0 - lf) + mat_g[mat, li + 1] * lf
                     dx, dy, dz = _hg_dir(dx, dy, dz, g, _rnd(rng, i), _rnd(rng, i))
-                    nbn[i] += 1
+                    nbn[i] += 1  # nbn counts every event (analysis); nsc only the volume-scattering ones
+                    nsc[i] += 1
                     if r_id < nrec:
                         k = path_n[r_id]
                         if k < maxpts:
@@ -285,7 +292,7 @@ def step_kernel(
                             path_buf[r_id, k, 2] = oz
                             path_n[r_id] = k + 1
                             _aux(path_aux, r_id, k, -1, EV_SCAT, w)
-                    if nbn[i] > max_b:
+                    if nsc[i] > max_sc:
                         special[c, MAXB] += w
                         if ana:
                             outc[i] = OUT_MAXB
@@ -334,7 +341,7 @@ def step_kernel(
                     _aux(path_aux, r_id, k, tri_gface[tri], EV_TRANS, w)
 
             nbn[i] += 1
-            if nbn[i] > max_b:
+            if nbn[i] - nsc[i] > max_b:  # surface hits only: volume scattering has its own cap
                 special[c, MAXB] += w
                 if ana:
                     outc[i] = OUT_MAXB
@@ -590,6 +597,7 @@ def step_kernel(
                     ex_buf[c, pix, 0] += tw * cx0
                     ex_buf[c, pix, 1] += tw * cy0
                     ex_buf[c, pix, 2] += tw * cz0
+                    ex2_buf[c, pix] += (tw * cy0) * (tw * cy0)  # squares of the luminous deposits: the noise of the map
                     det_pow[c, di] += tw
                     if ana:
                         dep_pix[i] = pix
@@ -604,6 +612,13 @@ def step_kernel(
                             cone_buf[c, pix, 0] += tw * cx0
                             cone_buf[c, pix, 1] += tw * cy0
                             cone_buf[c, pix, 2] += tw * cz0
+                            cone2_buf[c, pix] += (tw * cy0) * (tw * cy0)
+                        # the rings around the cone: ring r holds the rays with cos(e_r) >= ct > cos(e_r+1) (det_ring: cos of the edges, falling)
+                        for rr in range(NRING):
+                            if ct <= det_ring[di, rr] and ct > det_ring[di, rr + 1]:
+                                ring_buf[c, pix, rr] += tw * cy0
+                                ring2_buf[c, pix, rr] += (tw * cy0) * (tw * cy0)
+                                break
                         thb = min(int(math.acos(min(ct, 1.0)) / (0.5 * math.pi) * nth), nth - 1)
                         dir_buf[c, di, thb, 0] += tw * cx0
                         dir_buf[c, di, thb, 1] += tw * cy0

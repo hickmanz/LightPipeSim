@@ -19,6 +19,7 @@ import numpy as np
 
 from . import store
 from .engine import spectral
+from .materials import mie as _mie
 
 Curve = Any
 
@@ -63,15 +64,26 @@ _PMMA_ABS = {
 }
 
 
-def _diffuser(id_: str, name: str, wt: float, d_um: float) -> dict:
+def _diffuser(id_: str, name: str, wt: float, d_um: float = _mie.DEFAULT_DIAMETER_UM) -> dict:
     return {
         "id": id_,
         "name": name,
         "builtin": True,
         "n": {"type": "cauchy", "A": 1.5609, "B": 0.0087},
         "absorption": _PC_ABS,
-        "scattering": {"type": "mie", "tio2_wt_pct": wt, "diameter_um": d_um, "host": "pc", "g_floor": 0.0},
-        "notes": "PC with rutile TiO2 filler: scattering from Mie theory (monodisperse spheres).",
+        "scattering": {
+            "type": "mie",
+            "tio2_wt_pct": wt,
+            "diameter_um": d_um,
+            "sigma_g": _mie.DEFAULT_SIGMA_G,
+            "host": "pc",
+            "efficiency": _mie.DEFAULT_EFFICIENCY,
+        },
+        "notes": (
+            "PC with rutile TiO2 filler: scattering from Mie theory for an ideally dispersed filler (spheres, size spread "
+            f"{_mie.DEFAULT_SIGMA_G:g}). Real compounds usually scatter somewhat less (agglomeration): lower the "
+            "dispersion efficiency after comparing with one measured part."
+        ),
     }
 
 
@@ -122,10 +134,12 @@ BUILTIN_MATERIALS: dict[str, dict] = {
             "absorption": 0.0001,
             "scattering": {"type": "none"},
         },
-        _diffuser("pc_tio2_0p01", "PC + 0.01 wt% TiO2 (very light diffusion)", 0.01, 0.25),
-        _diffuser("pc_tio2_0p03", "PC + 0.03 wt% TiO2", 0.03, 0.25),
-        _diffuser("pc_tio2_0p1", "PC + 0.1 wt% TiO2", 0.1, 0.25),
-        _diffuser("pc_tio2_0p3", "PC + 0.3 wt% TiO2 (strong diffusion)", 0.3, 0.25),
+        _diffuser("pc_tio2_0p001", "PC + 0.001 wt% TiO2 (trace, long light pipes)", 0.001),
+        _diffuser("pc_tio2_0p003", "PC + 0.003 wt% TiO2 (very light diffusion)", 0.003),
+        _diffuser("pc_tio2_0p01", "PC + 0.01 wt% TiO2 (light diffusion)", 0.01),
+        _diffuser("pc_tio2_0p03", "PC + 0.03 wt% TiO2", 0.03),
+        _diffuser("pc_tio2_0p1", "PC + 0.1 wt% TiO2", 0.1),
+        _diffuser("pc_tio2_0p3", "PC + 0.3 wt% TiO2 (strong diffusion)", 0.3),
     ]
 }
 
@@ -269,6 +283,48 @@ BUILTIN_LEDS: dict[str, dict] = {
                 "intensity (R 340-800, G 600-1500, B 150-360 mcd), so the middle of each range is used (570 / 1050 / 255 mcd) "
                 "and converted with flux = pi x I for a Lambertian pattern (the diffuser makes it close to cos^1). "
                 "Real parts vary by about +/-40 % in flux per channel (binning)."
+            ),
+        },
+        {
+            "id": "cree_qls6b_fkw_cnsnsf043",
+            "name": "Cree LED QLS6B-FKW-CNSNSF043 RGB (PLCC6, 4.7 x 1.3 mm, 120 deg)",
+            "channels": [
+                {
+                    "id": "R",
+                    "name": "Red (14 mA)",
+                    "flux_lm": 1.74,
+                    "spectrum": {"type": "gaussian", "peak": 627, "fwhm": 24},
+                    "pattern": _lambertian_pattern(1.0),
+                },
+                {
+                    "id": "G",
+                    "name": "Green (12 mA)",
+                    "flux_lm": 3.65,
+                    "spectrum": {"type": "gaussian", "peak": 521, "fwhm": 38},
+                    "pattern": _lambertian_pattern(1.0),
+                },
+                {
+                    "id": "B",
+                    "name": "Blue (16 mA)",
+                    "flux_lm": 0.43,
+                    "spectrum": {"type": "gaussian", "peak": 460, "fwhm": 28},
+                    "pattern": _lambertian_pattern(1.0),
+                },
+            ],
+            # Cavity opening of the PLCC6 body (4.45 x 1.17 mm in the outline drawing); the three dies sit inside it.
+            # The long side is the LED's x axis.
+            "emitter": {"shape": "rect", "size": [4.45, 1.17]},
+            "notes": (
+                "Cree LED CLD-CT1397 rev 8 (PLCC6 3-in-1, 4.7 x 1.3 x 1.5 mm). Drive level 1.0 = the datasheet test currents "
+                "(R 14 mA / G 12 mA / B 16 mA; absolute maximum 30 / 20 / 20 mA). From the datasheet: package and cavity size, "
+                "viewing angle (far-field pattern is close to cos^1, 120 deg), spectral bandwidth (FWHM 24 / 38 / 28 nm) and the "
+                "peak wavelengths read off the spectrum plot (627 / 521 / 460 nm; the kit allows dominant wavelengths of "
+                "619-624 / 520-540 / 460-480 nm). Estimated: the datasheet gives one luminous intensity range for the three "
+                "dies lit together (900-2800 mcd, bin NS), not per colour. The middle of the range (1850 mcd, flux = pi x I for "
+                "a Lambertian pattern, 5.8 lm) is split over the channels so that the mix lands on the centre of the white colour "
+                "bins 5A-8D (x 0.28, y 0.25), which gives about 30 / 63 / 7 % of the flux in R / G / B. Real parts vary a lot "
+                "(the kit spans a 3x intensity range and +/-0.02 in colour coordinates): measure or bin-select one lot before "
+                "trusting absolute levels."
             ),
         },
     ]

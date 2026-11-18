@@ -1,0 +1,2 @@
+warp-lang>=1.7  # optional: the GPU solver (an NVIDIA GPU with a current driver)
+
